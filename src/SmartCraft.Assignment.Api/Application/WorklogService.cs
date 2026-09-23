@@ -27,9 +27,13 @@ public sealed class WorklogService(AppDbContext db)
         // write lock below — no DB access, so no reason to serialize on it.
         var worklog = Worklog.Create(command.WorkerId, command.ProjectId, command.WorkDate, command.Hours, command.Description);
 
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        try
+        return await WithBusyMappingAsync(async () =>
         {
+            // BeginTransactionAsync itself is what takes SQLite's write lock (BEGIN IMMEDIATE —
+            // see EnsureDailyHoursWithinLimitAsync), so it has to run inside the busy-mapping
+            // guard too, not before it.
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+
             var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == command.ProjectId, ct)
                 ?? throw new DomainException(DomainErrorKind.NotFound, $"Project {command.ProjectId} was not found.");
 
@@ -49,11 +53,7 @@ public sealed class WorklogService(AppDbContext db)
             await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
             return worklog;
-        }
-        catch (SqliteException ex) when (IsBusyOrLocked(ex))
-        {
-            throw BusyConflict(ex);
-        }
+        });
     }
 
     /// <summary>
@@ -61,29 +61,47 @@ public sealed class WorklogService(AppDbContext db)
     /// new) date. Rule 1 is not re-checked here: WorkerId/ProjectId cannot change via Update,
     /// and there is no worker-unassignment operation yet, so a worklog that was validly
     /// assigned at Create time cannot become invalid later (see AI_LOG AI-006).
+    ///
+    /// Ordering: <see cref="Worklog.Update"/> (rule 4/8 lifecycle check, rule 2 hours-range
+    /// check) runs *before* <see cref="EnsureDailyHoursWithinLimitAsync"/> (rule 3), so a
+    /// non-Draft worklog or an out-of-range hours value is rejected with its own Conflict/
+    /// Validation error rather than being masked by an unrelated daily-limit Validation error.
+    /// This is safe to do before the daily-hours check even though nothing has been saved yet:
+    /// <c>Worklog.Update</c> only mutates the in-memory tracked entity — if the daily-hours
+    /// check below throws, the transaction is rolled back (disposed without Commit) and nothing
+    /// reaches the database. The daily-hours query itself is unaffected by the ordering either
+    /// way, because it already excludes this worklog's own row by id and reads the DB, not the
+    /// change tracker. A failed call does leave the tracked entity holding the new, unsaved
+    /// values in memory (reviewer note M1/AI-009); this was originally left uncleared on the
+    /// (incorrect) assumption that WorklogService is always used one-call-per-request. That
+    /// assumption does not hold — nothing enforces it, WorklogService is not even registered in
+    /// DI yet — and a second finding confirmed the resulting hole with a concrete repro (Update
+    /// rejected by rule 3 leaves the entity dirty; a subsequent Submit on the same service
+    /// instance then persists the never-validated hours). <see cref="WithBusyMappingAsync{T}"/>
+    /// now calls <c>db.ChangeTracker.Clear()</c> on every failure from this method (and every
+    /// other write path), which closes that hole regardless of how the service is reused.
     /// </summary>
     public async Task<Worklog> UpdateWorklogAsync(UpdateWorklogCommand command, CancellationToken ct = default)
     {
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        try
+        return await WithBusyMappingAsync(async () =>
         {
+            // See CreateWorklogAsync: BeginTransactionAsync belongs inside the busy-mapping
+            // guard, not before it.
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+
             var worklog = await db.Worklogs.FirstOrDefaultAsync(w => w.Id == command.WorklogId, ct)
                 ?? throw NotFound(command.WorklogId);
 
             CheckExpectedVersion(worklog, command.ExpectedVersion);
 
-            await EnsureDailyHoursWithinLimitAsync(worklog.WorkerId, command.WorkDate, command.Hours, excludingWorklogId: worklog.Id, ct);
-
             worklog.Update(command.WorkDate, command.Hours, command.Description);
+
+            await EnsureDailyHoursWithinLimitAsync(worklog.WorkerId, command.WorkDate, command.Hours, excludingWorklogId: worklog.Id, ct);
 
             await SaveWithConcurrencyCheckAsync(ct);
             await transaction.CommitAsync(ct);
             return worklog;
-        }
-        catch (SqliteException ex) when (IsBusyOrLocked(ex))
-        {
-            throw BusyConflict(ex);
-        }
+        });
     }
 
     /// <summary>Load -> expected-version check -> transition -> save. No explicit transaction:
@@ -97,15 +115,18 @@ public sealed class WorklogService(AppDbContext db)
 
     private async Task<Worklog> TransitionAsync(Guid worklogId, long expectedVersion, Action<Worklog> transition, CancellationToken ct)
     {
-        var worklog = await db.Worklogs.FirstOrDefaultAsync(w => w.Id == worklogId, ct)
-            ?? throw NotFound(worklogId);
+        return await WithBusyMappingAsync(async () =>
+        {
+            var worklog = await db.Worklogs.FirstOrDefaultAsync(w => w.Id == worklogId, ct)
+                ?? throw NotFound(worklogId);
 
-        CheckExpectedVersion(worklog, expectedVersion);
+            CheckExpectedVersion(worklog, expectedVersion);
 
-        transition(worklog);
+            transition(worklog);
 
-        await SaveWithConcurrencyCheckAsync(ct);
-        return worklog;
+            await SaveWithConcurrencyCheckAsync(ct);
+            return worklog;
+        });
     }
 
     private static void CheckExpectedVersion(Worklog worklog, long expectedVersion)
@@ -150,12 +171,22 @@ public sealed class WorklogService(AppDbContext db)
     /// isolation level/deferred flag needs to be passed explicitly, this is EF Core's default
     /// against Sqlite. A second writer that tries to open a conflicting BEGIN IMMEDIATE while
     /// this one is open blocks (does not fail immediately) for up to the connection's busy
-    /// timeout (Microsoft.Data.Sqlite's "Default Timeout" keyword, 30s by default, maps to
-    /// sqlite3_busy_timeout); once the timeout elapses SQLite raises SQLITE_BUSY, which
-    /// surfaces as a SqliteException that CreateWorklogAsync/UpdateWorklogAsync map to an
-    /// explicit (retryable) Conflict rather than a raw exception.
+    /// timeout. Corrected (was previously documented as sqlite3_busy_timeout — verified wrong
+    /// by decompiling Microsoft.Data.Sqlite 10.0.12: there is no P/Invoke call to
+    /// sqlite3_busy_timeout or a native busy_handler anywhere in the library): it is a managed
+    /// retry loop in SqliteCommand/SqliteDataReader — on SQLITE_BUSY/SQLITE_LOCKED it calls
+    /// `Thread.Sleep(150)` and retries until the command's CommandTimeout elapses.
+    /// CommandTimeout defaults to the connection's DefaultTimeout ("Default Timeout"
+    /// connection-string keyword, 30s by default). Because the wait is `Thread.Sleep`, it
+    /// blocks the calling thread even through the async APIs and does not observe
+    /// CancellationToken. Once the timeout elapses SQLite raises SQLITE_BUSY/SQLITE_LOCKED,
+    /// which surfaces as a SqliteException (raw, or wrapped in DbUpdateException by
+    /// SaveChanges) that <see cref="WithBusyMappingAsync{T}"/> maps to an explicit (retryable)
+    /// Conflict rather than a raw exception.
     ///
-    /// Ceiling: this is SQLite-specific. On Postgres/SQL Server at READ COMMITTED, two
+    /// Ceiling: this is SQLite-specific, and even on SQLite it only serializes writers that
+    /// share the same local database file on one host/process group — it says nothing about
+    /// multiple hosts or a networked database. On Postgres/SQL Server at READ COMMITTED, two
     /// concurrent transactions could each read the same pre-update total and both decide
     /// their own addition keeps it under 24, producing a lost update (docs/04, "daily-hours
     /// race"). Production fix: lock a per-(worker, date) row — e.g. an upsert into a
@@ -180,6 +211,70 @@ public sealed class WorklogService(AppDbContext db)
             throw new DomainException(
                 DomainErrorKind.Validation,
                 $"Worker's total hours on {workDate:yyyy-MM-dd} would be {total}, exceeding the 24-hour daily limit.");
+        }
+    }
+
+    /// <summary>
+    /// Shared guard that every write path (Create/Update/Submit/Approve) routes through,
+    /// instead of a catch copy-pasted onto each one. Two independent jobs:
+    ///
+    /// 1. Busy/locked mapping: SQLITE_BUSY/SQLITE_LOCKED can surface either as a raw
+    /// <see cref="SqliteException"/> (e.g. while <c>BeginTransactionAsync</c> is blocked
+    /// acquiring BEGIN IMMEDIATE's write lock, or while <c>CommitAsync</c> is blocked
+    /// acquiring the lock needed to flush at commit) or wrapped in a
+    /// <see cref="DbUpdateException"/> (SaveChanges wraps provider exceptions). Both are
+    /// mapped to the same retryable Conflict.
+    ///
+    /// 2. Change-tracker cleanup: on *any* failure (not just busy/locked — every exception,
+    /// including domain Validation/Conflict/NotFound), <c>db.ChangeTracker.Clear()</c> is
+    /// called before rethrowing. This is required, not just tidy: an in-progress mutation
+    /// (e.g. <c>UpdateWorklogAsync</c> calling <c>worklog.Update(...)</c> before the
+    /// daily-hours check) leaves the tracked entity holding the new, unsaved values even
+    /// though the surrounding DB transaction was rolled back — EF's ChangeTracker is not
+    /// transaction-scoped and a disposed-without-commit transaction does not revert it. If
+    /// the same <see cref="WorklogService"/>/<see cref="AppDbContext"/> instance is then
+    /// reused for a later, unrelated call against the same tracked entity (nothing in this
+    /// project currently guarantees one <see cref="WorklogService"/> per request —
+    /// it is not registered in DI), a query for that entity returns the still-dirty tracked
+    /// instance (EF's identity resolution does not overwrite in-memory values with the
+    /// freshly-queried ones), and an unrelated later SaveChanges (e.g. Submit) would persist
+    /// the abandoned, never-validated change. Clearing the tracker on every failure closes
+    /// that hole. The optimistic-concurrency <c>Version</c> token does NOT close it: it only
+    /// detects concurrent *database* changes made by another writer, not a stale in-memory
+    /// mutation reused within the same context/request.
+    ///
+    /// <see cref="DbUpdateConcurrencyException"/> is itself a <see cref="DbUpdateException"/>,
+    /// so ordering matters: it is explicitly excluded from the DbUpdateException-busy catch
+    /// below so it keeps propagating to <see cref="SaveWithConcurrencyCheckAsync"/>'s own
+    /// catch, which maps it to its own (more specific) Conflict message before it reaches the
+    /// final catch-all here (which still clears the tracker for it, like for every other
+    /// exception). In practice a DbUpdateConcurrencyException's InnerException is never a
+    /// busy/locked SqliteException anyway (it's raised by EF's own affected-row-count check,
+    /// not a provider error), so the `when` filter alone would already exclude it — the
+    /// explicit exclusion just makes that invariant visible rather than relying on it
+    /// implicitly.
+    /// </summary>
+    private async Task<T> WithBusyMappingAsync<T>(Func<Task<T>> operation)
+    {
+        try
+        {
+            return await operation();
+        }
+        catch (SqliteException ex) when (IsBusyOrLocked(ex))
+        {
+            db.ChangeTracker.Clear();
+            throw BusyConflict(ex);
+        }
+        catch (DbUpdateException ex) when (ex is not DbUpdateConcurrencyException
+            && ex.InnerException is SqliteException inner && IsBusyOrLocked(inner))
+        {
+            db.ChangeTracker.Clear();
+            throw BusyConflict(inner);
+        }
+        catch
+        {
+            db.ChangeTracker.Clear();
+            throw;
         }
     }
 

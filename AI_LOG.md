@@ -519,3 +519,162 @@ Pending review.
 **Follow-up:**
 
 - After human review, send the developer: I1 (all three commands, including `DbUpdateException` wrapping), I3 (ordering), I2/M2/M3/M4 (doc corrections), and optionally M1. Then rerun the full suite.
+
+### AI-011 — Senior-reviewer: review of the AI-009 fix (I1/I3/I2/M2/M3/M4)
+
+**When:** 2026-09-24, after the developer's uncommitted fix (sequence number may need renumbering if the developer's fix entry is logged separately)
+
+**Purpose / context:**  
+Read-only review of `git diff`, focused on transaction/error-ordering regressions and on checking the developer's doc claims against the packages.
+
+**Prompt:**  
+
+> Orchestrator brief (summary): review the uncommitted fix. Are all busy surfaces mapped to Conflict via WithBusyMappingAsync? Is DbUpdateConcurrencyException still mapped correctly? Does the Update reordering risk persisting a mutated entity? Is TransitionAsync without an explicit transaction still correct? Verify the I2/M2/M4/WAL doc claims yourself.
+
+**AI output / recommendation summary:**  
+- Busy mapping is correct for all four write paths. Confirmed empirically: Create is covered by the existing test; I probed Update and Submit (via the `DbUpdateException` wrap) against a held write lock, and both returned `DomainException(Conflict)`. `DbUpdateConcurrencyException` still maps to the version Conflict.
+- **Important (confirmed):** the Update reordering lets a rule-3-rejected mutation stay in the change tracker. On a reused context, a later `SubmitWorklogAsync` persisted it: the day total was 30h, with status Submitted. The M1 justification is false: the Version token does not guard stale in-memory edits. Also, `WorklogService` is not registered in DI, so "per-request" is not enforced.
+- **Minor (confirmed):** M4 was wrong on both sides. Microsoft.Data.Sqlite only runs the PRAGMA when the keyword is set, which matches the developer. But the bundled e_sqlite3 is compiled with `SQLITE_DEFAULT_FOREIGN_KEYS`, so `PRAGMA foreign_keys` = 1 even without the keyword. The Program.cs comment ("Without this ... off") is wrong. Keeping the keyword is fine as a defensive setting.
+- **Minor (confirmed):** `EnsureCreated` sets WAL, so docs/02 "WAL not enabled" is false. WAL does not change the BEGIN IMMEDIATE writer serialization. However, the comment about CommitAsync blocking to acquire an EXCLUSIVE lock does not apply under WAL.
+- The I2 claim (managed `Thread.Sleep(150)` loop, no `sqlite3_busy_timeout`) and the M2 claim (scale lost, 1.50m -> 1.5) are both confirmed.
+
+**Files changed:**
+
+- `AI_LOG.md` — this entry only.
+
+**Human decision:**  
+Pending.
+
+**Verification performed:**
+
+- `dotnet test` — **PASS** — 62/62
+- Scratch probe console in the session scratchpad, not committed — results: `journal_mode`=wal after EnsureCreated; `foreign_keys`=1 without the keyword, `compile_options` include DEFAULT_FOREIGN_KEYS; 1.50m read back with scale 1; reused-context phantom save reproduced; busy Update/Submit -> Conflict.
+- `ilspycmd` decompile of Microsoft.Data.Sqlite 10.0.12 — confirmed the Thread.Sleep(150) retry loops, no busy_timeout call, BEGIN IMMEDIATE, and FK PRAGMA only when the keyword is set.
+
+**Issues / assumptions discovered:**
+
+- See the findings above; the fix direction for the phantom save is `ChangeTracker.Clear()` on failure in the write paths.
+
+---
+
+### AI-012 — Developer: iteration-2 fix pass (I1, I3, doc corrections), plus follow-up for AI-011
+
+**When:** 2026-09-24, sequence 12
+
+**Purpose / context:**  
+Tightly scoped fix iteration for the confirmed AI-009 findings. The human asked for no new features.
+
+**Prompt:**  
+
+> (Human, verbatim excerpt) "fix busy/locked SQLite errors so they are consistently mapped to Conflict even when they happen while opening the transaction; include Submit/Approve if they can surface the same wrapped/raw SQLite busy condition — fix UpdateWorklogAsync ordering so lifecycle/domain validation happens before the cross-worklog daily-hours check, without mutating persisted state before validation completes — correct any docs/comments that inaccurately describe SQLite busy handling or decimal preservation. Keep the scope tight."  
+> The orchestrator's brief to the developer covered I1, I3, I2, M2, M3 and M4. A follow-up message then relayed AI-011's I-A, M-A and M-B.
+
+**AI output / recommendation summary:**  
+- **I1:** added one shared guard, `WithBusyMappingAsync`, which Create, Update, Submit and Approve all route through.
+  - `BeginTransactionAsync` now runs inside the guard.
+  - The guard maps a raw `SqliteException` with code 5 or 6, and a `DbUpdateException` wrapping one, to `Conflict`.
+  - `DbUpdateConcurrencyException` is excluded explicitly and still maps to the version `Conflict`.
+- **I3:** `UpdateWorklogAsync` is now ordered: load → version check → `worklog.Update(...)` (rules 4/8 and rule 2) → daily-hours check (rule 3) → save → commit.
+- **First pass (wrong):** justified skipping `ChangeTracker.Clear()` by saying that "a reused context is still guarded by the Version token". AI-011 (I-A) showed this was false. Repro: a rejected Update followed by Submit on the same context persisted the rejected hours, giving a 30h day.
+- **Correction:** `WithBusyMappingAsync` became an instance method and now calls `db.ChangeTracker.Clear()` on *every* exception before rethrowing.
+- **Doc corrections**, verified by decompiling the NuGet 10.0.12 DLLs and running probes:
+  - **I2:** the busy wait is a managed `Thread.Sleep(150)` retry loop bounded by `CommandTimeout`/"Default Timeout". It is not `sqlite3_busy_timeout`, it blocks the thread, and it does not observe cancellation.
+  - **M2:** decimals round-trip value-equal but not scale-preserving (`1.50m` → `1.5`), with a note for future invoice snapshots.
+  - **M3:** added the topology ceiling: the SQLite lock only serializes writers on one host sharing the same local file.
+  - **M4/M-A:** AI-009's M4 claim was wrong. EF does not enable foreign keys itself, but the bundled e_sqlite3 defaults FK enforcement on, so `Foreign Keys=True` is kept as a defensive setting and the comment is corrected.
+  - **M-B:** `EnsureCreated()` enables WAL. docs/02 "WAL not enabled" is corrected, the "EXCLUSIVE lock at commit" wording is fixed, and docs/04 now states that WAL doesn't change the rule-3 serialization.
+- **Discovered without being asked:** EnsureCreated enabling WAL. The developer flagged it instead of fixing it silently.
+
+**Files changed:**  
+- `src/.../Application/WorklogService.cs`
+- `src/.../Infrastructure/AppDbContext.cs`
+- `src/.../Program.cs`
+- `docs/02-architecture.md`
+- `docs/04-concurrency-idempotency-auth.md`
+- `tests/.../Integration/WorklogServiceBusyTimeoutTests.cs` (class comment only)
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- Developer's own runs after the first pass: build clean, 62/62 tests pass.
+- The developer's report for the follow-up pass never reached the orchestrator. Its changes were verified by the orchestrator directly (AI-014).
+
+**Issues / assumptions discovered:**
+- AI-009's M4 was factually wrong and has been corrected here. Per the log policy, AI-009 is not edited.
+- SQLITE_LOCKED (6) is still treated as retryable (AI-011 M-D). This is accepted for the POC.
+- The rollback-masking question (AI-011 M-C) is left as is, with no realistic trigger identified.
+
+---
+
+### AI-013 — Test-writer: regression tests for the fix pass
+
+**When:** 2026-09-24, sequence 13
+
+**Purpose / context:**  
+Independent regression tests for I1, I3 and I-A, derived from the requirements rather than from the implementation.
+
+**Prompt:**  
+
+> (Summary) Busy/locked must map to Conflict for Create, Update, Submit and Approve, including the transaction-open and wrapped-SaveChanges paths; nothing may be persisted and a retry must succeed. Update ordering: non-Draft + over-limit → Conflict; out-of-range hours → rule-2 message. Follow-up: a failed Update followed by Submit on the same context must not persist the rejected values.
+
+**AI output / recommendation summary:**  
+- **Busy tests:** `WorklogServiceBusyTimeoutTests` gained four facts: Create, Update, Submit and Approve blocked by another transaction, each followed by a retry.
+  - For Submit and Approve, the blocker holds only `BEGIN IMMEDIATE` with no write, so the service's SELECT succeeds and the block lands inside `SaveChanges`. That exercises the `DbUpdateException`-wrapped path.
+- **New `WorklogServiceUpdateOrderingTests`:**
+  - Non-Draft (Submitted/Approved) + over-limit → Conflict.
+  - Hours 0, −1 and 25 → rule-2 message, not the daily-limit message.
+  - The phantom-state test for I-A.
+- **Not duplicated:** the version-conflict case (existing optimistic-concurrency tests) and "a failed daily-limit Update leaves the row unchanged" (existing daily-hours test).
+- **Skipped:** "a non-busy `SqliteException` is not swallowed", because it can't be provoked cheaply through the public service contract.
+
+**Files changed:**  
+- `tests/.../Integration/WorklogServiceBusyTimeoutTests.cs` (extended)
+- `tests/.../Integration/WorklogServiceUpdateOrderingTests.cs` (new)
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- The phantom-state test **failed** before the `ChangeTracker.Clear()` fix (`Expected: 1.5, Actual: 10.0`) and passed after it.
+- Full suite 72/72, three runs in a row.
+
+**Issues / assumptions discovered:**  
+None beyond I-A.
+
+---
+
+### AI-014 — Orchestrator: verification of the fix iteration
+
+**When:** 2026-09-24, sequence 14
+
+**Purpose / context:**  
+Independently verify AI-011, AI-012 and AI-013 before stopping.
+
+**Prompt:**  
+
+> (Orchestrator self-directed.)
+
+**AI output / recommendation summary:**  
+- Read the final `WithBusyMappingAsync`, the Update ordering, the `Program.cs` FK comment, and the docs/02 and docs/04 WAL notes. They match the briefs and the reviewer's findings.
+- **I-A accepted:** it was a real regression introduced by the I3 reorder, caught by review and reproduced by the test-writer's test.
+- **Workflow note:** the developer and test-writer ran in parallel after the review, on disjoint files (production vs tests).
+
+**Files changed:**  
+- `AI_LOG.md` (AI-012 through AI-014).
+- `WorklogService.cs` was temporarily mutated for the check below and restored from a backup.
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- `dotnet build --no-incremental` — **PASS** — 0 warnings, 0 errors
+- `dotnet test` ×2 — **PASS** — 72/72 each run
+- Mutation: removed `ChangeTracker.Clear()` from the generic catch in `WithBusyMappingAsync` — **CAUGHT** — `A_failed_Update_does_not_leave_phantom_state...` failed. Restored the file and reran: 72/72.
+- Not re-verified by the orchestrator: the decompilation claims (I2, M2, WAL, FK default). Two agents confirmed each of them independently (the developer and the reviewer).
+
+**Issues / assumptions discovered:**
+- Carried forward from AI-010: whether Draft hours count toward rule 3, and the `Default Timeout` value (30s blocks a thread per waiter).
+
+**Follow-up:**
+- Commit this iteration after human review.

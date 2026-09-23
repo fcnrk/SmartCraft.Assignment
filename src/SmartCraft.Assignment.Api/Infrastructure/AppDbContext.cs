@@ -17,7 +17,16 @@ namespace SmartCraft.Assignment.Api.Infrastructure;
 /// round-tripping string conversion (verified against
 /// Microsoft.EntityFrameworkCore.Sqlite.Core 10.0.12's
 /// SqliteDecimalTypeMapping: storeType "TEXT", no lossy double conversion) —
-/// so a stored Hours value reads back bit-for-bit equal to what was written.
+/// so a stored Hours value reads back value-equal to what was written, but
+/// NOT bit-for-bit: the write-side format string (verified by decompiling
+/// SqliteDecimalTypeMapping) is <c>"{0:0.0###########################}"</c>
+/// — one mandatory decimal digit, then up to 27 optional (`#`) ones, which
+/// drops trailing zeros. E.g. 1.50m is formatted as "1.5" and reads back as
+/// 1.5m (scale 1, not 2): decimal.Equals still holds (1.50m == 1.5m), but
+/// the original scale/trailing zeros are not preserved. Relevant to future
+/// invoice snapshots: don't rely on a persisted decimal's rendered
+/// scale/trailing zeros for display — format explicitly wherever a fixed
+/// number of decimal places matters.
 /// What TEXT storage does NOT give you is a numerically-correct SQL SUM()/
 /// comparison: SQLite has no arbitrary-precision decimal arithmetic, so
 /// aggregating decimal columns in SQL is not safe. The rule-3 daily-hours
