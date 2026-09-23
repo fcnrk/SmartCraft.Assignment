@@ -871,3 +871,167 @@ Pending review.
 - I1: validate the calculator's output before the legacy adapter lands.
 - M1, M3, M5: constraint-code narrowing, rate scale and upper bound.
 - Next phase: the idempotency key, the legacy adapter plus the differential harness, and endpoints.
+
+
+---
+
+### AI-019 — Developer: API endpoints, JWT auth, idempotency, I1 fix, Swagger, Docker
+
+**When:** 2026-09-24, sequence 19
+
+**Purpose / context:**  
+Finish the API surface. Also close reviewer finding I1 (AI-017), which says `InvoiceService` must validate the calculator's output.
+
+**Prompt:**  
+
+> (Human) "Let's finish the API. Add minimal endpoints for projects/worklogs/invoices, JWT auth with simple permission policies, and idempotency for invoice creation. Don't forget swagger and dockerizing the project. Keep it lean. Add only essential API/integration tests. Also fix the reviewer finding that InvoiceService must validate calculator output before accepting it. Use developer + test-writer, skip the full reviewer unless something significant comes up. Update AI_LOG and stop when green."
+>
+> (Orchestrator → developer, summary) A decided spec:
+> - I1 validation: lines map 1:1 to eligible worklogs, per-line consistency checks, and `InvalidOperationException` before anything persists.
+> - `IdempotencyRecord`: looked up inside the existing BEGIN IMMEDIATE transaction and written in the same SaveChanges. Same key and project replays (200), a different project is a 409, and a PK race replays the winner.
+> - Narrow constraint codes to 1555/2067 (M1).
+> - Minimal API endpoints with DTOs and a `DomainException`→ProblemDetails handler.
+> - JWT with a symmetric config key, `sub` = workerId, `permission` claims, and one policy per capability registered in a loop.
+> - Ownership checked after load; create derives the WorkerId from `sub`; self-approval is forbidden.
+> - Development-only `/dev/token`, an idempotent seed with fixed GUIDs, and Swashbuckle with Bearer.
+> - Multi-stage Dockerfile.
+> - Docs, README and CLAUDE.md updates. No new tests.
+
+**AI output / recommendation summary:**  
+Implemented as specified.
+- `CreateInvoiceAsync(projectId, idempotencyKey)` now returns `InvoiceCreationResult(Invoice, IsReplay)`.
+- The single-column `Key` PK has no Operation scope, since there is only one idempotent operation. This is documented in `IdempotencyRecord`.
+- `worklog:read` doesn't exist, so `GET /api/worklogs/{id}` only requires an authenticated caller. This assumption is documented.
+- Added `project:read`.
+- `Worker.Create`/`Project.Create` gained an optional `Guid? id` for the fixed seed ids.
+- Swashbuckle 10.2.3 brings Microsoft.OpenApi 2.x, which has a new security-reference API. The developer resolved it by reflecting over the installed assembly.
+- Mechanically updated 21 call sites in 4 existing invoice test files, with a distinct key per call so independent requests don't become replays.
+- **Declined to edit CLAUDE.md** because its agent instructions forbid it, and proposed replacement text instead. Left for the human.
+
+**Files changed:**  
+- `Application/InvoiceService.cs`
+- `Domain/{Worker,Project}.cs`
+- `Infrastructure/{AppDbContext,IdempotencyRecord,SeedData}.cs`
+- `Authorization/{Permissions,ClaimsPrincipalExtensions}.cs`
+- `Endpoints/{Project,Worklog,Invoice,DevToken}Endpoints.cs`, `Endpoints/DomainExceptionHandler.cs`
+- `Program.cs`, the csproj, `appsettings.Development.json`
+- `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.gitignore`
+- `README.md`, `docs/03-api-transactions.md`, `docs/04-concurrency-idempotency-auth.md`
+- 4 existing integration test files (mechanical updates only)
+
+**Human decision:**  
+Pending review.
+
+**Verification performed (developer-reported):**
+- `dotnet build --no-incremental` — **PASS** — 0 warnings, 0 errors
+- `dotnet test` — **PASS** — 105/105
+- `docker build` plus `docker run` smoke test — **PASS**
+  - Anonymous request gets 401, and a token works.
+  - Worklog lifecycle: self-approval gets 403, and approval by another identity succeeds.
+  - Invoice without a key gets 400, the first create gets 201, and a replay gets 200 with the same id.
+  - Same key on a different project gets 409, and a key over 200 characters gets 400.
+  - `GET` of the invoice succeeds, and the DB file is under `/data`.
+
+**Verification performed (orchestrator):**
+- Read `InvoiceService` (idempotency lookup, replay, the PK-race path and `ValidateCalculatedLines`) — consistent with the spec.
+- Grepped the endpoints — every business endpoint has `RequireAuthorization`, and ownership is checked after load.
+
+**Issues / assumptions discovered:**
+- The idempotency key is global, not scoped per caller. Any `invoice:create` holder who reuses another caller's key gets that invoice replayed. Acceptable because that caller could read it with `invoice:read` anyway. Scope keys by `sub` if tenants or other callers must be isolated.
+- Any authenticated caller can read any worklog (no `worklog:read` / ownership check on GET).
+- The container runs as root with `ASPNETCORE_ENVIRONMENT=Development`. This is POC-only and noted in the README.
+
+**Follow-up:**
+- The CLAUDE.md "Repository state and commands" section is stale. The human should decide whether to apply the developer's suggested text.
+
+---
+
+### AI-020 — Test-writer: essential API/idempotency/I1 tests (aborted)
+
+**When:** 2026-09-24, sequence 20
+
+**Purpose / context:**  
+Independent tests for AI-019.
+
+**Prompt:**  
+
+> (Summary) About 10–15 essential tests, derived from the docs:
+> - I1 bad-calculator cases with nothing persisted;
+> - idempotency replay, different project, concurrent same key, and a failed attempt recording nothing;
+> - HTTP tests via WebApplicationFactory: 401, 403, the happy flow with replay, a missing key, ownership and self-approval, and a stale version returning 409;
+> - plus mutation checks.
+
+**AI output / recommendation summary:**  
+**Failed.** The agent terminated with an API error (monthly spend limit, HTTP 429) before writing any file. `git status` confirmed no test files were created.
+
+**Files changed:**  
+- None.
+
+**Human decision:**  
+The human said "continue". Re-spawning the agent was likely to hit the same limit, so the orchestrator wrote the tests inline (AI-021).
+
+**Verification performed:**
+- `git status --short tests/` — only the developer's 4 mechanical edits.
+
+**Issues / assumptions discovered:**
+- The tests below were written by the orchestrator, not by an independent test-writer. Their independence from the implementation is therefore weaker than the CLAUDE.md workflow intends. They were derived from docs/03 and docs/04 contracts, and mutation-checked to compensate.
+
+**Follow-up:**
+- None.
+
+---
+
+### AI-021 — Orchestrator: essential tests, one production fix, mutation checks
+
+**When:** 2026-09-24, sequence 21
+
+**Purpose / context:**  
+Complete AI-020's scope.
+
+**Prompt:**  
+
+> (Orchestrator self-directed, same scope as AI-020.)
+
+**AI output / recommendation summary:**  
+- `Integration/InvoiceServiceIdempotencyAndValidationTests.cs`:
+  - replay: same id, `IsReplay`, and new eligible work is not swept in;
+  - same key on a different project gives Conflict;
+  - 4 concurrent same-key requests give exactly one invoice and one record;
+  - a failed attempt records nothing, so a retry runs fresh;
+  - a Theory with 6 calculator corruptions (drop, duplicate, unknown id, hours, total, rate) throws `InvalidOperationException` with no invoice, no record, and worklogs still Approved.
+- `Api/ApiTests.cs`: a WebApplicationFactory in Development with a per-test SQLite file and real seed, and tokens from `/dev/token`. Covers:
+  - 401;
+  - 403 for a missing permission;
+  - the full flow: create → submit → approve by Carol → missing key 400 → 201 with total 800 → retry 200 with the same id → GET 200;
+  - Bob update/submit on Alice's worklog 403, and self-approval 403;
+  - a stale `ExpectedVersion` gives 409 as ProblemDetails.
+- Added the `Microsoft.AspNetCore.Mvc.Testing` 10.0.12 package.
+- **Bug found by the tests:** `DomainExceptionHandler` wrote ProblemDetails with `WriteAsJsonAsync`, so the content type was `application/json`, not `application/problem+json`. That was inconsistent with the endpoints' own `Results.Problem` 400/403 responses. Fixed by using `Results.Problem(...).ExecuteAsync(httpContext)`, which also removed an unused using.
+
+**Files changed:**  
+- `tests/SmartCraft.Assignment.Tests/Integration/InvoiceServiceIdempotencyAndValidationTests.cs` (new)
+- `tests/SmartCraft.Assignment.Tests/Api/ApiTests.cs` (new)
+- `tests/SmartCraft.Assignment.Tests/SmartCraft.Assignment.Tests.csproj`
+- `src/SmartCraft.Assignment.Api/Endpoints/DomainExceptionHandler.cs`
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- First build — **FAIL** — CS1061: missing `using Microsoft.AspNetCore.Hosting` for `UseEnvironment`. Fixed.
+- `dotnet test` — **FAIL** — 119/120. The stale-version test got content type `application/json`. Fixed in production code (above).
+- `dotnet build` — **PASS** — 0 warnings, 0 errors
+- `dotnet test` — **PASS** — 120/120
+- Mutation "skip `ValidateCalculatedLines`" — **CAUGHT** — 5/6 Theory cases failed.
+  - The surviving case, "duplicate", still throws `InvalidOperationException` from a downstream guard before persisting. So I1's duplicate check is defense in depth there, not the only guard.
+- Mutation "skip idempotency lookup" — **CAUGHT** — 4 tests failed: replay, different project, concurrent same key, and the API flow.
+- Restored `InvoiceService.cs` from backup. The diff stat matches the developer's version.
+- `dotnet test` — **PASS** — 120/120
+
+**Issues / assumptions discovered:**
+- The senior reviewer was not run, per the human's instruction. No significant issue came up that warranted it.
+
+**Follow-up:**
+- Reviewer I2 (overtime allocation depends on invoicing order), M3 and M5 remain open.
+- The legacy adapter and differential harness remain open.
+- The CLAUDE.md commands section needs a human decision.

@@ -64,16 +64,40 @@ Idempotency solves retries of the same logical command; it is not a replacement 
 
 Invoice creation requires an `Idempotency-Key` (or equivalent explicit mechanism).
 
-**POC decision (iteration 3): not implemented yet.** `InvoiceService.CreateInvoiceAsync` has no
-idempotency-key mechanism this iteration — a client retry of the same logical "create invoice
-for project X" request after a successful first attempt will not replay the original invoice;
-it will either find no eligible worklogs left (`Validation`, since they are already `Invoiced`)
-or, if some new approved worklogs arrived in between, create a second, smaller invoice. This is
-scoped out deliberately (no API endpoints exist yet for invoice creation either) rather than
-built superficially. Follow-up: implement per the record shape suggested below (key +
-scope/operation + request fingerprint + status + resulting resource id), backed by a DB
-uniqueness constraint on the key, at the same time `POST /api/projects/{projectId}/invoices` is
-built (docs/03-api-transactions.md).
+**POC decision (endpoints iteration): implemented.** `POST /api/projects/{projectId}/invoices`
+requires an `Idempotency-Key` header (docs/03-api-transactions.md); `InvoiceService.
+CreateInvoiceAsync(projectId, idempotencyKey, ct)` looks up an `IdempotencyRecord` by key as the
+*first* read inside the same `BEGIN IMMEDIATE` transaction used for everything else in that
+method (see its doc comment). Record shape: `Key` (string, primary key — no separate
+Operation/scope column, since invoice creation is the only idempotent operation in this POC;
+add one if a second operation needs it), `ProjectId` (the request fingerprint — the only input
+that varies invoice creation), `InvoiceId`, `CreatedAt`.
+
+- same key + same `ProjectId` -> replay: return the original invoice, no new effect (`200 OK`
+  at the endpoint, vs `201 Created` for a first-time success).
+- same key + a different `ProjectId` -> `409 Conflict`: the key does not describe this request.
+- concurrent same-key requests: `IdempotencyRecord.Key` being the table's primary key is the
+  defense-in-depth constraint (mirrors the `InvoiceLine.WorklogId` PK pattern used for rule 9).
+  Under this POC's SQLite `BEGIN IMMEDIATE` serialization this constraint cannot actually be hit
+  (the lookup and the insert are both inside one exclusive writer transaction — see
+  `CreateInvoiceAsync`'s doc comment for the same ceiling note as everywhere else in this
+  section), but the code path exists for any DB/isolation level where that exclusivity does not
+  hold: `InvoiceService` catches the PK violation, distinguishes it from the unrelated
+  `InvoiceLine.WorklogId` PK violation via which entity failed to insert
+  (`DbUpdateException.Entries`), and — since SQLite does not partially apply a failed
+  statement's transaction — rolls back its own attempt and replays the winner's now-committed
+  record instead of surfacing a spurious error to the loser.
+- **a failed attempt records nothing** (e.g. "no eligible worklogs" `Validation`): the
+  `IdempotencyRecord` is only added to the same `SaveChanges`/commit as a successful invoice, so
+  a retry with the same key after a failure reruns the request fresh rather than replaying the
+  failure. This is a deliberate, documented choice, not an oversight — "idempotent" here means
+  "a repeated *successful* request has no additional effect", not "every response, including
+  failures, is cached forever".
+
+Reviewer finding M1 (constraint-code breadth): the PK/unique-violation check narrowed from the
+broad `SQLITE_CONSTRAINT` (19) primary code to the specific extended codes
+`SQLITE_CONSTRAINT_PRIMARYKEY` (1555) / `SQLITE_CONSTRAINT_UNIQUE` (2067), so an unrelated FK or
+NOT NULL violation is not misclassified as a `Conflict`.
 
 Persist enough information to distinguish:
 
@@ -102,6 +126,22 @@ Use a lightweight POC-friendly JWT bearer setup. Do not spend time on implementi
 
 Identity should expose a stable subject/worker mapping where required.
 
+### POC decision (endpoints iteration)
+
+JWT bearer via `Microsoft.AspNetCore.Authentication.JwtBearer`, symmetric (HMAC-SHA256) key
+from configuration (`Jwt:Key`/`Jwt:Issuer`/`Jwt:Audience`) — no default key, a missing one fails
+startup fast rather than silently accepting an insecure default. The real (dev) key lives only
+in `appsettings.Development.json`; `appsettings.json` (base/Production) has none, so this POC
+only meaningfully runs in Development (see `README.md` "Known limitations" — there is no token
+issuance path for any other environment). Token claims: `sub` = WorkerId (Guid), zero or more
+`permission` claims. `JwtBearerOptions.MapInboundClaims = false` keeps claim types exactly as
+issued ("sub", "permission") instead of ASP.NET's default remap to long `ClaimTypes` URIs.
+
+Since there is no real identity provider, `POST /dev/token` (Development-only, mapped only when
+`ASPNETCORE_ENVIRONMENT=Development`; not present otherwise) mints a signed token for any
+`{ workerId, permissions[] }` the caller supplies, no credentials required — an explicit,
+documented POC stand-in, not a security control.
+
 ## Authorization
 
 Prefer capability policies such as:
@@ -122,3 +162,29 @@ Example intent:
 Authentication establishes who the caller is. Authorization establishes whether the caller may request an action. Domain rules still determine whether the action is valid in the current business state.
 
 Do not rely only on endpoint authorization if ownership/resource-specific authorization must also be checked after loading the resource.
+
+### POC decision (endpoints iteration)
+
+One ASP.NET Core authorization policy per permission string above, named after the permission
+itself, plus `project:read` (not in the original list — added for the read-only project
+endpoints; docs/03 "Optional only if time permits" already anticipated project/worker setup
+endpoints). Registered via a loop over `Permissions.All` (`Authorization/Permissions.cs`), not
+copy-pasted per policy — each policy is `RequireClaim("permission", <the permission string>)`.
+
+Resource ownership (docs/04 "Do not rely only on endpoint authorization..."):
+
+- **Create**: `WorkerId` is derived directly from the caller's `sub` claim
+  (`ClaimsPrincipalExtensions.GetWorkerId`), not read from the request body — bypass-proof by
+  construction, no ownership check needed because there is no attacker-controlled field to
+  check.
+- **Update/Submit**: the worklog is loaded first, then `worklog.WorkerId == caller` is checked
+  ("check after loading") — `403 Forbidden` otherwise. `WorkerId` is immutable once a worklog
+  exists (no reassignment operation), so there is no meaningful race between this pre-check load
+  and `WorklogService`'s own load inside its transaction.
+- **Approve**: `worklog:approve` is a capability any approver holds; ownership is inverted here
+  — the endpoint loads the worklog and returns `403 Forbidden` if `worklog.WorkerId == caller`
+  (a worklog may not be approved by the worker who logged it).
+
+No `worklog:read` permission exists in the list above; `GET /api/worklogs/{id}` only requires
+*some* valid, authenticated identity (`RequireAuthorization()` with no policy) — a narrower
+per-worklog read policy was judged out of scope for this POC's read-mostly-non-sensitive data.

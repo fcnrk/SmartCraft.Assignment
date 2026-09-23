@@ -17,12 +17,12 @@ public class InvoiceServiceConcurrencyTests
 {
     private readonly record struct InvoiceAttemptResult(bool Success, DomainErrorKind? FailureKind, Invoice? Invoice);
 
-    private static async Task<InvoiceAttemptResult> AttemptAsync(Func<Task<Invoice>> action)
+    private static async Task<InvoiceAttemptResult> AttemptAsync(Func<Task<InvoiceCreationResult>> action)
     {
         try
         {
-            var invoice = await action();
-            return new InvoiceAttemptResult(true, null, invoice);
+            var result = await action();
+            return new InvoiceAttemptResult(true, null, result.Invoice);
         }
         catch (DomainException ex)
         {
@@ -53,12 +53,12 @@ public class InvoiceServiceConcurrencyTests
             var taskA = Task.Run(async () =>
             {
                 await gate.Task;
-                return await AttemptAsync(() => serviceA.CreateInvoiceAsync(fx.ProjectId));
+                return await AttemptAsync(() => serviceA.CreateInvoiceAsync(fx.ProjectId, $"key-a-{iteration}"));
             });
             var taskB = Task.Run(async () =>
             {
                 await gate.Task;
-                return await AttemptAsync(() => serviceB.CreateInvoiceAsync(fx.ProjectId));
+                return await AttemptAsync(() => serviceB.CreateInvoiceAsync(fx.ProjectId, $"key-b-{iteration}"));
             });
 
             gate.SetResult();
@@ -119,12 +119,12 @@ public class InvoiceServiceConcurrencyTests
             var alphaTask = Task.Run(async () =>
             {
                 await gate.Task;
-                return await AttemptAsync(() => alphaInvoiceService.CreateInvoiceAsync(fx.ProjectId));
+                return await AttemptAsync(() => alphaInvoiceService.CreateInvoiceAsync(fx.ProjectId, $"alpha-key-{iteration}"));
             });
             var betaTask = Task.Run(async () =>
             {
                 await gate.Task;
-                return await AttemptAsync(() => betaInvoiceService.CreateInvoiceAsync(fx.SecondProjectId));
+                return await AttemptAsync(() => betaInvoiceService.CreateInvoiceAsync(fx.SecondProjectId, $"beta-key-{iteration}"));
             });
 
             gate.SetResult();
@@ -166,7 +166,7 @@ public class InvoiceServiceConcurrencyTests
 
         var invoiceService = fx.NewInvoiceService();
         var stopwatch = Stopwatch.StartNew();
-        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId));
+        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId, "blocked-key"));
         stopwatch.Stop();
 
         Assert.Equal(DomainErrorKind.Conflict, ex.Kind);
@@ -184,7 +184,10 @@ public class InvoiceServiceConcurrencyTests
         }
 
         var retryService = fx.NewInvoiceService();
-        var retried = await retryService.CreateInvoiceAsync(fx.ProjectId);
-        Assert.Single(retried.Lines);
+        // Same key as the failed attempt above: a failed attempt records nothing (docs/04
+        // "Idempotency"), so this reruns fresh rather than replaying a failure.
+        var retried = await retryService.CreateInvoiceAsync(fx.ProjectId, "blocked-key");
+        Assert.False(retried.IsReplay);
+        Assert.Single(retried.Invoice.Lines);
     }
 }

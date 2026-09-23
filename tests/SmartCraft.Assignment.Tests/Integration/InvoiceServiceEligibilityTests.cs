@@ -24,7 +24,7 @@ public class InvoiceServiceEligibilityTests
         await worklogService.SubmitWorklogAsync(new SubmitWorklogCommand(submittedOnly.Id, submittedOnly.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId));
+        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1"));
         Assert.Equal(DomainErrorKind.Validation, ex.Kind);
 
         using var freshDb = fx.CreateContext();
@@ -39,7 +39,7 @@ public class InvoiceServiceEligibilityTests
         using var fx = new SqliteWorklogFixture();
         var invoiceService = fx.NewInvoiceService();
 
-        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(Guid.NewGuid()));
+        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(Guid.NewGuid(), "key-1"));
 
         Assert.Equal(DomainErrorKind.NotFound, ex.Kind);
     }
@@ -54,9 +54,11 @@ public class InvoiceServiceEligibilityTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(created.Id, submitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1");
 
-        await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId));
+        // A different key: a genuinely new client request, not a retry, so this must hit the
+        // business rule (nothing left to invoice) rather than replay the first invoice.
+        await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-2"));
 
         using var freshDb = fx.CreateContext();
         Assert.Equal(1, await freshDb.Invoices.CountAsync());
@@ -72,7 +74,7 @@ public class InvoiceServiceEligibilityTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(created.Id, submitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        var original = await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        var original = (await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1")).Invoice;
 
         // Reload through a brand-new InvoiceService/AppDbContext/connection, like a separate
         // request hitting a different API instance.
@@ -109,7 +111,7 @@ public class InvoiceServiceEligibilityTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(created.Id, submitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        var invoice = await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        var invoice = (await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1")).Invoice;
         var originalRate = Assert.Single(invoice.Lines).HourlyRate;
         Assert.Equal(100m, originalRate);
 

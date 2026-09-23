@@ -480,3 +480,10 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Local SQLite database (docs/02-architecture.md: EnsureCreated(), not checked in)
+*.db-shm
+*.db-wal
+*.db-journal
+smartcraft.db
+data/

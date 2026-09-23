@@ -23,7 +23,7 @@ public class InvoiceServiceTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(created.Id, submitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        var invoice = await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        var invoice = (await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1")).Invoice;
 
         var line = Assert.Single(invoice.Lines);
         Assert.Equal(created.Id, line.WorklogId);
@@ -45,7 +45,7 @@ public class InvoiceServiceTests
         using var fx = new SqliteWorklogFixture();
         var invoiceService = fx.NewInvoiceService();
 
-        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId));
+        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1"));
 
         Assert.Equal(DomainErrorKind.Validation, ex.Kind);
     }
@@ -68,7 +68,7 @@ public class InvoiceServiceTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(otherProjectApproved.Id, otherSubmitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        var invoice = await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        var invoice = (await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1")).Invoice;
 
         var line = Assert.Single(invoice.Lines);
         Assert.Equal(approved.Id, line.WorklogId);
@@ -90,9 +90,11 @@ public class InvoiceServiceTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(created.Id, submitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1");
 
-        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId));
+        // A different key: a genuinely new request, not a retry, so this must hit rule 9's
+        // double-invoicing guard rather than replay the first invoice.
+        var ex = await Assert.ThrowsAsync<DomainException>(() => invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-2"));
         Assert.Equal(DomainErrorKind.Validation, ex.Kind);
 
         using var freshDb = fx.CreateContext();
@@ -112,7 +114,7 @@ public class InvoiceServiceTests
         var alphaSubmitted = await worklogService.SubmitWorklogAsync(new SubmitWorklogCommand(alphaWork.Id, alphaWork.Version));
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(alphaWork.Id, alphaSubmitted.Version));
         var invoiceService = fx.NewInvoiceService();
-        await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        await invoiceService.CreateInvoiceAsync(fx.ProjectId, "alpha-key");
 
         // Then 4h approved on Project Beta for the same worker/day: only 2h of normal
         // capacity remain for that day, across projects.
@@ -120,7 +122,7 @@ public class InvoiceServiceTests
         var betaSubmitted = await worklogService.SubmitWorklogAsync(new SubmitWorklogCommand(betaWork.Id, betaWork.Version));
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(betaWork.Id, betaSubmitted.Version));
 
-        var betaInvoice = await invoiceService.CreateInvoiceAsync(fx.SecondProjectId);
+        var betaInvoice = (await invoiceService.CreateInvoiceAsync(fx.SecondProjectId, "beta-key")).Invoice;
 
         var line = Assert.Single(betaInvoice.Lines);
         Assert.Equal(2m, line.NormalHours);

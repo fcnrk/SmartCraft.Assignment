@@ -5,12 +5,16 @@ using SmartCraft.Assignment.Api.Infrastructure;
 
 namespace SmartCraft.Assignment.Api.Application;
 
+/// <summary>Result of <see cref="InvoiceService.CreateInvoiceAsync"/>: the invoice, plus
+/// whether this call actually created it (<c>false</c>) or replayed an earlier successful
+/// call with the same Idempotency-Key (<c>true</c>) — the endpoint uses this to answer 201 vs
+/// 200 (docs/03-api-transactions.md).</summary>
+public sealed record InvoiceCreationResult(Invoice Invoice, bool IsReplay);
+
 /// <summary>
 /// Cross-aggregate orchestration for invoice generation (docs/02-architecture.md "Application
 /// orchestration", docs/03-api-transactions.md "Create invoice"). Uses AppDbContext directly,
-/// same as WorklogService. Idempotency-key handling (docs/04-concurrency-idempotency-auth.md
-/// "Idempotency") is explicitly out of scope for this iteration — see CreateInvoiceAsync's doc
-/// comment.
+/// same as WorklogService.
 /// </summary>
 public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculator, TimeProvider timeProvider)
 {
@@ -43,13 +47,31 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
     /// Worklog.Version concurrency token (a worklog claimed/modified between load and save)
     /// and InvoiceLine's WorklogId-as-primary-key (rule 9, double-invoicing) are DB constraints
     /// that hold on any database, independent of isolation level — see
-    /// SaveInvoiceWithConcurrencyCheckAsync.
+    /// <see cref="TrySaveAsync"/>.
+    ///
+    /// Idempotency (docs/04 "Idempotency"): <paramref name="idempotencyKey"/> is required by
+    /// the endpoint. The key is looked up inside the same BEGIN IMMEDIATE transaction, before
+    /// any other read: same key + same <paramref name="projectId"/> replays the original
+    /// invoice (no new effect); same key + a different project is a Conflict. A record is only
+    /// written on a successful invoice creation, in the same SaveChanges/commit as the invoice
+    /// and worklog claims — a failed attempt (e.g. no eligible worklogs) leaves no record, so a
+    /// retry with the same key after a failure runs the request fresh rather than replaying a
+    /// failure. The DB primary key on <c>IdempotencyRecord.Key</c> is defense-in-depth for a
+    /// concurrent same-key request that reaches SaveChanges after this method's own lookup
+    /// found nothing (see <see cref="TrySaveAsync"/>): the loser rolls back and replays the
+    /// winner's now-committed record instead of erroring.
     /// </summary>
-    public async Task<Invoice> CreateInvoiceAsync(Guid projectId, CancellationToken ct = default)
+    public async Task<InvoiceCreationResult> CreateInvoiceAsync(Guid projectId, string idempotencyKey, CancellationToken ct = default)
     {
         return await WithBusyMappingAsync(async () =>
         {
             await using var transaction = await db.Database.BeginTransactionAsync(ct);
+
+            var existingRecord = await db.IdempotencyRecords.FirstOrDefaultAsync(r => r.Key == idempotencyKey, ct);
+            if (existingRecord is not null)
+            {
+                return await ResolveReplayAsync(existingRecord, projectId, ct);
+            }
 
             var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == projectId, ct)
                 ?? throw new DomainException(DomainErrorKind.NotFound, $"Project {projectId} was not found.");
@@ -83,6 +105,13 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
 
             var calculatedLines = calculator.Calculate(billingInputs, priorNormalHoursByWorkerDate);
 
+            // Reviewer finding I1: the calculator is an external seam (a future legacy adapter
+            // implements the same interface) — its output is not trusted blindly. A mismatch
+            // here is a calculator bug, not a client error, so it throws InvalidOperationException
+            // (-> 500) before anything is persisted, rather than silently short-invoicing or
+            // corrupting a snapshot.
+            ValidateCalculatedLines(billingInputs, calculatedLines);
+
             var invoiceLines = calculatedLines
                 .Select(l => InvoiceLine.Create(
                     l.WorklogId, l.WorkerId, l.WorkDate, l.WorkerRole, l.HourlyRate,
@@ -98,10 +127,95 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
                 worklogsById[line.WorklogId].MarkInvoiced(invoice.Id);
             }
 
-            await SaveInvoiceWithConcurrencyCheckAsync(ct);
+            db.IdempotencyRecords.Add(IdempotencyRecord.Create(idempotencyKey, projectId, invoice.Id, timeProvider.GetUtcNow()));
+
+            if (await TrySaveAsync(ct) == SaveOutcome.IdempotencyKeyRace)
+            {
+                // Another request with the same key committed first between our lookup above
+                // and our own SaveChanges. Discard this attempt (nothing else was committed —
+                // SQLite doesn't partially apply a failed statement's transaction) and replay
+                // the winner's record instead of surfacing a spurious error.
+                await transaction.RollbackAsync(ct);
+                db.ChangeTracker.Clear();
+                var winningRecord = await db.IdempotencyRecords.FirstOrDefaultAsync(r => r.Key == idempotencyKey, ct)
+                    ?? throw new DomainException(DomainErrorKind.Conflict, "Idempotency key race could not be resolved. Retry the request.");
+                return await ResolveReplayAsync(winningRecord, projectId, ct);
+            }
+
             await transaction.CommitAsync(ct);
-            return invoice;
+            return new InvoiceCreationResult(invoice, IsReplay: false);
         });
+    }
+
+    /// <summary>Same key, same project -> replay the original invoice. Same key, different
+    /// project -> Conflict: the key does not describe this request.</summary>
+    private async Task<InvoiceCreationResult> ResolveReplayAsync(IdempotencyRecord record, Guid projectId, CancellationToken ct)
+    {
+        if (record.ProjectId != projectId)
+        {
+            throw new DomainException(
+                DomainErrorKind.Conflict,
+                $"Idempotency-Key '{record.Key}' was already used for a different project ({record.ProjectId}).");
+        }
+
+        var invoice = await db.Invoices.FirstOrDefaultAsync(i => i.Id == record.InvoiceId, ct)
+            ?? throw new DomainException(DomainErrorKind.Conflict, "Idempotency record exists but its invoice could not be found.");
+
+        return new InvoiceCreationResult(invoice, IsReplay: true);
+    }
+
+    /// <summary>
+    /// Reviewer finding I1: validates the calculator's output line-by-line against the
+    /// billing inputs it was given, rather than trusting it. Checks only what
+    /// <see cref="InvoiceLine.Create"/>/<see cref="Invoice.Create"/> do not already enforce
+    /// (they validate ProjectId/line count, not per-line consistency).
+    /// </summary>
+    private static void ValidateCalculatedLines(
+        IReadOnlyList<WorklogBillingInput> billingInputs, IReadOnlyList<CalculatedInvoiceLine> calculatedLines)
+    {
+        var inputsById = billingInputs.ToDictionary(i => i.WorklogId);
+
+        if (calculatedLines.Count != inputsById.Count)
+        {
+            throw new InvalidOperationException(
+                $"Invoice calculator returned {calculatedLines.Count} line(s) for {inputsById.Count} eligible worklog(s).");
+        }
+
+        var seenWorklogIds = new HashSet<Guid>();
+        foreach (var line in calculatedLines)
+        {
+            if (!seenWorklogIds.Add(line.WorklogId))
+            {
+                throw new InvalidOperationException($"Invoice calculator returned a duplicate line for worklog {line.WorklogId}.");
+            }
+
+            if (!inputsById.TryGetValue(line.WorklogId, out var input))
+            {
+                throw new InvalidOperationException($"Invoice calculator returned a line for unknown worklog {line.WorklogId}.");
+            }
+
+            if (line.WorkerId != input.WorkerId || line.WorkDate != input.WorkDate
+                || line.HourlyRate != input.HourlyRate || line.WorkerRole != input.WorkerRole)
+            {
+                throw new InvalidOperationException($"Invoice calculator line for worklog {line.WorklogId} does not match its billing input.");
+            }
+
+            if (line.NormalHours < 0 || line.OvertimeHours < 0 || line.NormalAmount < 0 || line.OvertimeAmount < 0)
+            {
+                throw new InvalidOperationException($"Invoice calculator line for worklog {line.WorklogId} produced a negative value.");
+            }
+
+            if (line.NormalHours + line.OvertimeHours != input.Hours)
+            {
+                throw new InvalidOperationException(
+                    $"Invoice calculator line for worklog {line.WorklogId} allocates {line.NormalHours + line.OvertimeHours} hours, expected {input.Hours}.");
+            }
+
+            if (line.LineTotal != line.NormalAmount + line.OvertimeAmount)
+            {
+                throw new InvalidOperationException($"Invoice calculator line for worklog {line.WorklogId} has a LineTotal inconsistent with its amounts.");
+            }
+        }
     }
 
     /// <summary>
@@ -126,18 +240,32 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
             .ToDictionary(g => g.Key, g => g.Sum(l => l.NormalHours));
     }
 
-    /// <summary>Catches two distinct races between this transaction's own reads above and
+    private enum SaveOutcome
+    {
+        Success,
+
+        /// <summary>A concurrent request with the same Idempotency-Key committed its
+        /// IdempotencyRecord first; see CreateInvoiceAsync's replay-and-discard handling.</summary>
+        IdempotencyKeyRace,
+    }
+
+    /// <summary>Catches three distinct races between this transaction's own reads above and
     /// another writer's commit in between: a worklog claimed/modified concurrently (Worklog's
-    /// Version concurrency token — same mechanism as WorklogService), and a worklog already
+    /// Version concurrency token — same mechanism as WorklogService), a worklog already
     /// carrying an invoice line (InvoiceLine.WorklogId is its primary key — rule 9's DB-level
-    /// guard, see AppDbContext). On SQLite under this method's BEGIN IMMEDIATE neither can
-    /// actually occur (see CreateInvoiceAsync's doc comment); this exists for any DB/isolation
-    /// level where that exclusivity does not hold.</summary>
-    private async Task SaveInvoiceWithConcurrencyCheckAsync(CancellationToken ct)
+    /// guard, see AppDbContext), and a concurrent request that already claimed the same
+    /// Idempotency-Key (IdempotencyRecord.Key primary key). On SQLite under this method's
+    /// BEGIN IMMEDIATE none of these can actually occur (see CreateInvoiceAsync's doc comment);
+    /// this exists for any DB/isolation level where that exclusivity does not hold. The
+    /// idempotency-key race is distinguished from the other two (which the caller cannot
+    /// recover from) because it is recoverable: <c>DbUpdateException.Entries</c> identifies
+    /// which tracked entity failed to insert.</summary>
+    private async Task<SaveOutcome> TrySaveAsync(CancellationToken ct)
     {
         try
         {
             await db.SaveChangesAsync(ct);
+            return SaveOutcome.Success;
         }
         catch (DbUpdateConcurrencyException)
         {
@@ -147,14 +275,22 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
         }
         catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
         {
+            if (ex.Entries.Any(e => e.Entity is IdempotencyRecord))
+            {
+                return SaveOutcome.IdempotencyKeyRace;
+            }
+
             throw new DomainException(
                 DomainErrorKind.Conflict,
                 "One or more worklogs have already been invoiced by another request. Reload and retry.");
         }
     }
 
+    /// <summary>Reviewer finding M1: narrowed from the broad SQLITE_CONSTRAINT (19) primary
+    /// error code to the specific extended codes for a primary-key/unique violation, so this
+    /// does not also swallow e.g. a FK or NOT NULL constraint failure as a "Conflict".</summary>
     private static bool IsUniqueConstraintViolation(DbUpdateException ex) =>
-        ex.InnerException is SqliteException { SqliteErrorCode: 19 }; // SQLITE_CONSTRAINT
+        ex.InnerException is SqliteException { SqliteExtendedErrorCode: 1555 or 2067 }; // SQLITE_CONSTRAINT_PRIMARYKEY / SQLITE_CONSTRAINT_UNIQUE
 
     /// <summary>Same SQLite busy/locked mapping + change-tracker cleanup as
     /// WorklogService.WithBusyMappingAsync — see that method's doc comment for the full

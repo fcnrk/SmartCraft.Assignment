@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.db-journal
+.git/
+.idea/
+.vs/
+docs/
+AI_LOG.md
+README.md

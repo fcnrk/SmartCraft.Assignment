@@ -40,6 +40,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<Project> Projects => Set<Project>();
     public DbSet<Worklog> Worklogs => Set<Worklog>();
     public DbSet<Invoice> Invoices => Set<Invoice>();
+    public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -111,6 +112,16 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
                 line.Property(l => l.WorkerRole).IsRequired();
                 line.HasOne<Worklog>().WithMany().HasForeignKey(l => l.WorklogId).OnDelete(DeleteBehavior.Restrict);
             });
+        });
+
+        // Idempotency-Key uniqueness (docs/04 "Idempotency"): Key as primary key gives the
+        // DB-level uniqueness constraint that InvoiceService's defense-in-depth race handling
+        // relies on for free — same reasoning as InvoiceLine.WorklogId above.
+        modelBuilder.Entity<IdempotencyRecord>(record =>
+        {
+            record.HasKey(r => r.Key);
+            record.Property(r => r.Key).HasMaxLength(200);
+            record.HasOne<Invoice>().WithMany().HasForeignKey(r => r.InvoiceId).OnDelete(DeleteBehavior.Restrict);
         });
     }
 

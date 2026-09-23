@@ -17,7 +17,9 @@ public sealed class Project
     {
     }
 
-    public static Project Create(string name)
+    /// <summary><paramref name="id"/> defaults to a new random id; an explicit value is only
+    /// for seeding fixed, documented ids (see Infrastructure/SeedData.cs).</summary>
+    public static Project Create(string name, Guid? id = null)
     {
         if (string.IsNullOrWhiteSpace(name))
         {
@@ -26,7 +28,7 @@ public sealed class Project
 
         return new Project
         {
-            Id = Guid.NewGuid(),
+            Id = id ?? Guid.NewGuid(),
             Name = name,
         };
     }

@@ -37,7 +37,7 @@ public class InvoiceServiceAtomicityTests
         await worklogService.ApproveWorklogAsync(new ApproveWorklogCommand(w2.Id, w2Submitted.Version));
 
         var invoiceService = fx.NewInvoiceService();
-        var firstInvoice = await invoiceService.CreateInvoiceAsync(fx.ProjectId);
+        var firstInvoice = (await invoiceService.CreateInvoiceAsync(fx.ProjectId, "key-1")).Invoice;
         Assert.Single(firstInvoice.Lines);
 
         // W1: a second, unrelated, otherwise-perfectly-valid Approved worklog.
@@ -55,7 +55,7 @@ public class InvoiceServiceAtomicityTests
         }
 
         var secondAttemptService = fx.NewInvoiceService();
-        var ex = await Assert.ThrowsAsync<DomainException>(() => secondAttemptService.CreateInvoiceAsync(fx.ProjectId));
+        var ex = await Assert.ThrowsAsync<DomainException>(() => secondAttemptService.CreateInvoiceAsync(fx.ProjectId, "key-2"));
         Assert.Equal(DomainErrorKind.Conflict, ex.Kind);
 
         using var freshDb = fx.CreateContext();

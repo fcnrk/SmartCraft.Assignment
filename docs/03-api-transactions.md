@@ -70,3 +70,25 @@ Return useful ProblemDetails-style errors rather than raw exceptions.
 Clients updating mutable resources should provide a version/ETag/concurrency value. Do not silently overwrite a newer version.
 
 The exact HTTP representation (ETag/If-Match vs version in DTO) can be chosen for scope, but document the trade-off.
+
+### POC decision (endpoints iteration)
+
+**Version in the request body** (`ExpectedVersion` on `UpdateWorklogRequest`/`TransitionRequest`),
+not `If-Match`/ETag headers. Every `WorklogResponse` also returns the current `Version`, so a
+client always has the value to send back. Trade-off: this is less HTTP-idiomatic than
+`If-Match` (which would let a generic HTTP cache/proxy participate, and maps naturally to `412
+Precondition Failed` instead of `409`), but it keeps the concurrency contract visible in the
+same JSON body as the rest of the request/response instead of split across headers, and avoids
+introducing `412` as a second "stale version" status code alongside the `409 Conflict` already
+used for lifecycle conflicts and idempotency-key conflicts — one status code for "valid request,
+current state disagrees" is simpler to document and to test. `WorklogService` already threw
+`DomainErrorKind.Conflict` for a version mismatch before any endpoint existed; this is the
+option that requires no new mapping.
+
+## Idempotency-Key header
+
+`POST /api/projects/{projectId}/invoices` requires an `Idempotency-Key` header. Missing, blank,
+or longer than 200 characters -> `400 Bad Request`, checked at the endpoint before the request
+reaches `InvoiceService` (docs/04 "Idempotency" has the full replay/conflict contract). First
+successful creation for a key -> `201 Created`; a replay of an already-succeeded key -> `200 OK`
+with the same invoice body (not `201` again, since nothing new was created).

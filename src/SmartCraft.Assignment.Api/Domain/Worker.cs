@@ -13,7 +13,9 @@ public sealed class Worker
     {
     }
 
-    public static Worker Create(string name)
+    /// <summary><paramref name="id"/> defaults to a new random id; an explicit value is only
+    /// for seeding fixed, documented ids (see Infrastructure/SeedData.cs).</summary>
+    public static Worker Create(string name, Guid? id = null)
     {
         if (string.IsNullOrWhiteSpace(name))
         {
@@ -22,7 +24,7 @@ public sealed class Worker
 
         return new Worker
         {
-            Id = Guid.NewGuid(),
+            Id = id ?? Guid.NewGuid(),
             Name = name,
         };
     }
