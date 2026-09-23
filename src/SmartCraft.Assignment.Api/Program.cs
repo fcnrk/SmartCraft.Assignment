@@ -20,6 +20,11 @@ var connectionString = builder.Configuration.GetConnectionString("Default")
     ?? "Data Source=smartcraft.db;Foreign Keys=True";
 builder.Services.AddDbContext<AppDbContext>(options => options.UseSqlite(connectionString));
 
+// Invoice.CreatedAt uses TimeProvider rather than DateTimeOffset.UtcNow directly, so tests
+// can substitute a fake clock. No endpoints consume InvoiceService yet (same as
+// WorklogService), so it is intentionally not registered in DI below.
+builder.Services.AddSingleton(TimeProvider.System);
+
 var app = builder.Build();
 
 app.MapGet("/", () => "Hello World!");

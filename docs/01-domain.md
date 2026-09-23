@@ -111,6 +111,45 @@ If a worker records time across multiple worklogs or projects on the same day, w
 
 For the POC, choose and document a deterministic policy (for example chronological worklog ordering with a stable tie-breaker). Differential tests should make this policy visible. In a real migration, recover and verify the rule from legacy behavior/domain experts.
 
+### POC decision (iteration 3)
+
+- **Scope of the 8h/day ceiling: per worker, per calendar day, ACROSS ALL PROJECTS**, not per
+  project. A worker's total normal-time capacity for a date is 8 hours regardless of how many
+  projects that time is split across.
+- **Consumption policy: "first-invoiced consumes normal time".** Remaining normal capacity for
+  a (worker, date) at the moment an invoice is generated = 8 − sum(NormalHours already
+  snapshotted on existing `InvoiceLine`s for that worker/date, any project). Draft, Submitted,
+  or Approved-but-not-yet-invoiced worklogs on other projects do **not** reserve normal time —
+  only worklogs that have actually been invoiced (and therefore have a snapshotted
+  `InvoiceLine`) count against the ceiling. This means the split for a given worklog can depend
+  on invoice-creation order across projects, which is the explicit trade-off of this policy —
+  see `docs/04-concurrency-idempotency-auth.md` "Scenario: competing invoice requests" for the
+  concurrency-correctness ceiling this implies.
+- **Deterministic allocation order within one invoice run:** worklogs for a given (worker,
+  date) are allocated in `(WorkDate, Worklog.Id)` order — `WorkDate` first (irrelevant within
+  one worker/date group, but keeps the whole batch's processing order stable/explainable), then
+  `Worklog.Id` as a stable tie-breaker. ponytail: `Worklog.Id` is an arbitrary-but-stable
+  tie-breaker, not legacy's real chronological order — `Worklog` has no creation timestamp
+  today. A real migration must recover and verify legacy's actual ordering rule before this can
+  be trusted as behaviorally equivalent; this POC's differential harness (future work, see
+  `docs/05-testing-and-differential.md`) is where that gap would surface as a mismatch.
+- **A single worklog can split into normal and overtime hours on the same line** (rule 14): the
+  remaining-normal-capacity check runs per worklog in the order above, consuming from the day's
+  remaining capacity until it is exhausted, then the rest of that worklog's hours become
+  overtime.
+- **Multiplier:** 1.5, a constant, snapshotted onto every `InvoiceLine.OvertimeMultiplier` (not
+  read live at invoice-view time) so it stays historically accurate even if the constant later
+  becomes configurable.
+- **Rounding (rule 15):** `NormalAmount = round(NormalHours * HourlyRate, 2,
+  MidpointRounding.AwayFromZero)`, `OvertimeAmount = round(OvertimeHours * HourlyRate * 1.5, 2,
+  MidpointRounding.AwayFromZero)` — each amount rounded independently, not the pre-rounded
+  hourly components — then `LineTotal = NormalAmount + OvertimeAmount` (sum of the two already-
+  rounded amounts) and `Invoice.Total = sum(LineTotal)`. `decimal` throughout; `double` is never
+  used for money.
+- **Implementation seam:** this policy lives in `Application/ModernInvoiceCalculator.cs`, a pure
+  function (no DB access) implementing `IInvoiceCalculator` — see
+  `docs/02-architecture.md` "Legacy modernization seam".
+
 ## Entity vs cross-aggregate invariants
 A Worklog can enforce `0 < Hours <= 24` itself.
 

@@ -39,6 +39,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<Worker> Workers => Set<Worker>();
     public DbSet<Project> Projects => Set<Project>();
     public DbSet<Worklog> Worklogs => Set<Worklog>();
+    public DbSet<Invoice> Invoices => Set<Invoice>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -61,6 +62,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
                 assignment.ToTable("ProjectAssignments");
                 assignment.WithOwner().HasForeignKey(a => a.ProjectId);
                 assignment.HasKey(a => new { a.ProjectId, a.WorkerId });
+                assignment.Property(a => a.WorkerRole).IsRequired();
                 assignment.HasOne<Worker>().WithMany().HasForeignKey(a => a.WorkerId).OnDelete(DeleteBehavior.Restrict);
             });
         });
@@ -85,6 +87,30 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 
             // Supports the rule-3 per-worker/date lookup.
             worklog.HasIndex(w => new { w.WorkerId, w.WorkDate });
+        });
+
+        modelBuilder.Entity<Invoice>(invoice =>
+        {
+            invoice.HasKey(i => i.Id);
+            invoice.HasOne<Project>().WithMany().HasForeignKey(i => i.ProjectId).OnDelete(DeleteBehavior.Restrict);
+
+            // InvoiceLine is owned by Invoice (docs/02-architecture.md "Invoice aggregate").
+            // Its key is WorklogId itself, not a generated id or a (InvoiceId, WorklogId)
+            // composite: rule 9 ("a worklog can be associated with at most one invoice")
+            // means WorklogId is already globally unique across every invoice line that will
+            // ever exist, so making it the primary key gives the task's required "DB UNIQUE
+            // index on InvoiceLine.WorklogId" for free — a PK is a unique index, enforced by
+            // SQLite regardless of the Worklog.Status check in InvoiceService. It also
+            // doubles as InvoiceLine's FK to Worklog below (a shared-key 1-to-(zero-or-)one
+            // relationship), which is exactly what rule 9 describes.
+            invoice.OwnsMany(i => i.Lines, line =>
+            {
+                line.ToTable("InvoiceLines");
+                line.WithOwner().HasForeignKey("InvoiceId");
+                line.HasKey(l => l.WorklogId);
+                line.Property(l => l.WorkerRole).IsRequired();
+                line.HasOne<Worklog>().WithMany().HasForeignKey(l => l.WorklogId).OnDelete(DeleteBehavior.Restrict);
+            });
         });
     }
 

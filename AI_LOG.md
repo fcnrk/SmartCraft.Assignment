@@ -678,3 +678,196 @@ Pending review.
 
 **Follow-up:**
 - Commit this iteration after human review.
+
+
+---
+
+### AI-015 — Developer: invoicing iteration (role/rate, Invoice/InvoiceLine, modern calculator, InvoiceService)
+
+**When:** 2026-09-24, sequence 15
+
+**Purpose / context:**  
+Phase 3 invoicing. The human requested it; the orchestrator briefed the developer and chose POC defaults for the open domain policies.
+
+**Prompt:**  
+
+> (Human, verbatim) "Next iteration: invoicing. Use the developer agent to add role + hourly rate to ProjectAssignment, then add Invoice/InvoiceLine and a modern invoice generator. Rules: only Approved, uninvoiced worklogs; invoice is for one project; first 8 daily hours normal, rest 1.5x overtime; snapshot rate/role into invoice lines; invoice creation + marking worklogs invoiced must be atomic. Also add a legacy invoice generator abstraction so we can differential-test legacy vs modern later. Then use test-writer for unit/integration tests and senior-reviewer for money, overtime, transaction and concurrency issues. Keep AI_LOG updated. Stop after verification."
+
+The orchestrator's brief set these defaults, pending human review:
+- **8h threshold:** per worker per day, across all projects.
+- **"First-invoiced consumes normal time":** remaining normal time is 8 minus the normal hours already snapshotted on earlier invoice lines.
+- **Allocation order:** (WorkDate, WorklogId).
+- **Rounding:** each amount rounded to 2dp, half away from zero; totals are sums of rounded amounts.
+- **Out of scope:** no idempotency key, no endpoints, no legacy adapter yet.
+
+**AI output / recommendation summary:**  
+- **Role and rate:** `ProjectAssignment` now has `WorkerRole` (non-empty) and `HourlyRate` (> 0).
+- **Invoice aggregate:** `Invoice` has `CreatedAt` taken from `TimeProvider`, and a `Total`. `InvoiceLine` is an immutable snapshot of the calculation inputs and results.
+  - `InvoiceLine`'s primary key is `WorklogId`, with a Restrict FK to `Worklog`. This is the database-level guard for rule 9.
+- **Legacy seam:** `IInvoiceCalculator` is a pure contract; `ModernInvoiceCalculator` is its only implementation.
+- **`InvoiceService.CreateInvoiceAsync`:** runs as one BEGIN IMMEDIATE transaction inside a busy guard (copied from `WorklogService`, not shared):
+  1. load the project;
+  2. load eligible worklogs (Validation error if there are none);
+  3. load prior normal hours;
+  4. calculate;
+  5. create the invoice;
+  6. call `MarkInvoiced` on each worklog;
+  7. save and commit.
+- **Error mapping:** `DbUpdateConcurrencyException` and SQLITE_CONSTRAINT both map to Conflict.
+- **Also added:** `GetInvoiceAsync`, and 12 developer tests.
+- **Docs:** docs/01, docs/02 and docs/04 gained "POC decision (iteration 3)" sections, including the idempotency deferral.
+
+**Files changed:**  
+- Domain: `ProjectAssignment.cs`, `Project.cs`, `Invoice.cs` (new), `InvoiceLine.cs` (new)
+- Application: `IInvoiceCalculator.cs` (new), `ModernInvoiceCalculator.cs` (new), `InvoiceService.cs` (new)
+- Infrastructure / host: `AppDbContext.cs`, `Program.cs`
+- Tests: `SqliteWorklogFixture.cs`, `ModernInvoiceCalculatorTests.cs`, `InvoiceServiceTests.cs`, `AppDbContextInvoiceMappingTests.cs`
+- Docs: `docs/01-domain.md`, `docs/02-architecture.md`, `docs/04-concurrency-idempotency-auth.md`
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- Developer's own runs: build clean; all tests passed.
+- The developer reported "84/84". The suite total was 105 after the test-writer added 22 tests, so the developer's number is probably off by one (theory/fact counting). Recorded as reported; not re-derived.
+
+**Issues / assumptions discovered:**
+- The developer duplicated the busy guard in `InvoiceService` rather than sharing it with `WorklogService`, and justified this in a code comment.
+- The primary key doubles as the unique index.
+- No direct test of the database constraint path was written, because `InvoiceLine.Create` is internal.
+
+---
+
+### AI-016 — Test-writer: invoicing tests
+
+**When:** 2026-09-24, sequence 16
+
+**Purpose / context:**  
+Independent, requirement-derived tests for invoicing, with an adversarial focus.
+
+**Prompt:**  
+
+> (Summary) Cover the calculator's boundaries, rounding midpoints, decimal exactness and order independence. Cover eligibility, snapshot survival and reload at service level. Cover atomicity on a mid-save failure. Cover concurrency: two invoices for the same project, and two projects sharing a worker/day. Cover busy mapping. Don't duplicate the developer's tests, and don't weaken any test.
+
+**AI output / recommendation summary:**  
+22 tests in four new files.
+- **`ModernInvoiceCalculatorAdversarialTests` (12):**
+  - the 8 / 8.01 boundary and a 24h day;
+  - prior hours at, above, and fractionally below 8;
+  - days and workers independent;
+  - midpoint rounding for normal and overtime amounts, chosen so AwayFromZero and ToEven give different results;
+  - 0.1+0.2+0.3 summed exactly;
+  - sum of rounded amounts vs rounding of the sum;
+  - shuffled input gives the same output.
+- **`InvoiceServiceEligibilityTests` (6):** includes the `GetInvoiceAsync` reload, and snapshot survival after a raw-SQL rate change.
+- **`InvoiceServiceAtomicityTests` (1):** forces an InvoiceLine primary-key collision, then asserts the whole batch rolled back, including an innocent worklog in the same batch.
+- **`InvoiceServiceConcurrencyTests` (3, each ×5 iterations):**
+  - same project: exactly one winner;
+  - two projects sharing a worker/day: combined normal hours are exactly 8;
+  - busy mapping: Conflict, then a retry succeeds.
+- **Not added:** idempotency tests, because the feature is documented as not implemented.
+
+**Files changed:**  
+- `tests/.../Domain/ModernInvoiceCalculatorAdversarialTests.cs` (new)
+- `tests/.../Integration/InvoiceServiceEligibilityTests.cs` (new)
+- `tests/.../Integration/InvoiceServiceAtomicityTests.cs` (new)
+- `tests/.../Integration/InvoiceServiceConcurrencyTests.cs` (new)
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- The test-writer found and fixed a bug in its own atomicity test: EF's "owned entity projected without owner" error. The fix was proper, not a weakening.
+- Full suite: 105/105 in 5 of 6 runs. The sixth run crashed in the VSTest host (`LoggerHelper.PrintHeader`) before any test executed. It was not reproduced.
+
+**Issues / assumptions discovered:**
+- A genuine race between load and save can't be produced from a second connection under BEGIN IMMEDIATE, so the atomicity test simulates the race window with a raw-SQL reset instead.
+
+---
+
+### AI-017 — Senior-reviewer: invoicing review (recorded by orchestrator)
+
+**When:** 2026-09-24, sequence 17
+
+**Purpose / context:**  
+Adversarial review of money, overtime, transactions and concurrency. The reviewer was read-only this time and did not write to the log itself.
+
+**Prompt:**  
+
+> (Summary) Review the invoicing diff with focus on decimal and rounding, overtime allocation and prior-consumption lookup, atomicity and the rule-9 database guard, SQLITE_CONSTRAINT mapping breadth, concurrent invoices (same project and cross-project), domain invariants, and scope. Classify findings as Critical/Important/Minor.
+
+**AI output / recommendation summary:**  
+No Critical findings. Confirmed correct:
+- atomicity: one SaveChanges and one commit inside BEGIN IMMEDIATE;
+- the PK/FK guard for rule 9;
+- no decimal arithmetic or comparison in SQL;
+- the prior-consumption keying;
+- the rate snapshot.
+
+Important:
+- **I1:** `InvoiceService` trusts the calculator's output. A legacy adapter that drops or duplicates lines, returns unknown ids, or produces inconsistent hours or amounts would cause a silent short invoice, a 500, or a misleading Conflict. Fix: validate a 1:1 match with the eligible worklogs and per-line consistency.
+- **I2:** "first-invoiced consumes normal time" makes billing depend on invoicing order. Example: 6h on A at 100 plus 6h on B at 120 totals 1560.00 or 1520.00 depending on which invoice runs first. A late-approved worklog becomes all overtime. This needs a domain decision.
+- **I3:** the concurrency, constraint, rollback and snapshot guarantees were untested. AI-016 has since covered most of this (the constraint via a simulated race, not a direct insert).
+
+Minor:
+- **M1:** SQLITE_CONSTRAINT (19) is too broad; use the extended codes 1555 and 2067.
+- **M2:** the prior-lines query is unbounded by date.
+- **M3:** rounding per worklog vs per day differs by a cent when a rate has more than 2dp. The rate scale is unrestricted.
+- **M4:** Guid tie-break ordering differs from SQL Server's `uniqueidentifier` order. Relevant to differential testing.
+- **M5:** no upper bound on rate, so an `OverflowException` becomes a 500.
+- **M6:** invoice lines are returned in no fixed order.
+- **M7:** the "no current assignment" Conflict is unreachable today.
+- **M8:** the duplicated busy guard is acceptable.
+
+**Files changed:**  
+- None.
+
+**Human decision:**  
+Pending. The human asked to stop after verification, so no fixes were applied.
+
+**Verification performed (orchestrator validation of findings against the code):**
+- I1: **CONFIRMED** by reading `InvoiceService.CreateInvoiceAsync`. `worklogsById[line.WorklogId]` is only indexed from the calculator's lines, and nothing checks coverage.
+- I2: **CONFIRMED** as a direct consequence of the policy the orchestrator chose; the arithmetic is correct.
+- M1–M8: plausible and consistent with the code, not independently re-verified.
+
+---
+
+### AI-018 — Orchestrator: verification of the invoicing iteration
+
+**When:** 2026-09-24, sequence 18
+
+**Purpose / context:**  
+Independent check before stopping, as the human requested.
+
+**Prompt:**  
+
+> (Orchestrator self-directed.)
+
+**AI output / recommendation summary:**  
+- Read `InvoiceService` and `ModernInvoiceCalculator`. They match the brief.
+- Ran mutation checks to confirm the new tests have teeth.
+
+**Files changed:**  
+- `AI_LOG.md` (AI-015 through AI-018).
+- `ModernInvoiceCalculator.cs` and `InvoiceService.cs` were temporarily mutated for the checks and restored from backups; `git diff` confirmed no residue.
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- `dotnet build --no-incremental` — **PASS** — 0 warnings, 0 errors
+- `dotnet test` ×2 — **PASS** — 105/105 each run
+- Mutation "rounding AwayFromZero → ToEven" — **CAUGHT** — 3 invoice tests failed
+- Mutation "no transaction in `CreateInvoiceAsync`", running `InvoiceServiceConcurrencyTests` ×3 — **CAUGHT 1 of 3 runs**
+  - Only probabilistic evidence, like rule 3 in AI-010.
+  - The same-project double-invoice stays protected without the transaction, by the Version token and the primary key. So only the cross-project normal-hours test can detect the mutation, and it does so by chance.
+- Restored the files and reran — **PASS** — 105/105
+
+**Issues / assumptions discovered:**
+- The cross-project normal-hours race test is weak at catching regressions. Consider more iterations, or a deterministic interleaving.
+
+**Follow-up (for human decision):**
+- I2: the overtime allocation policy (a domain decision).
+- I1: validate the calculator's output before the legacy adapter lands.
+- M1, M3, M5: constraint-code narrowing, rate scale and upper bound.
+- Next phase: the idempotency key, the legacy adapter plus the differential harness, and endpoints.

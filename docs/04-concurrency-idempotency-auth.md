@@ -30,11 +30,50 @@ Note: `Database.EnsureCreated()` (see docs/02-architecture.md, "Database" → "W
 
 Two different invoice commands select the same approved worklogs. At most one invoice may claim a given worklog. Use transaction/concurrency/database constraints so both cannot succeed.
 
+**POC decision (iteration 3):** `InvoiceService.CreateInvoiceAsync` opens its transaction the
+same way `WorklogService` does — `Database.BeginTransactionAsync()` before any read — which
+resolves to SQLite's `BEGIN IMMEDIATE` (see the daily-hours-race note above for the decompiled
+verification of that translation) and takes SQLite's single write lock up front. Two concurrent
+`CreateInvoiceAsync` calls against the same file are therefore fully serialized: the second
+call's reads (eligible worklogs, prior-invoiced normal hours) cannot observe a state the first
+call's transaction has not yet committed, so neither the same worklog nor the same worker/day's
+normal-time capacity can be double-claimed. On top of that, two DB-level constraints hold
+independent of SQLite's exclusivity, as defense in depth for any DB/isolation level: the
+`Worklog.Version` optimistic-concurrency token (a worklog claimed/modified between load and
+save fails with a mapped `Conflict`) and `InvoiceLine.WorklogId` being the primary key of the
+`InvoiceLines` table (rule 9 — a second line for an already-invoiced `WorklogId` is a DB
+constraint violation, also mapped to `Conflict`).
+
+**Ceiling:** identical to the daily-hours-race note above — this is SQLite's single-writer
+model, not a portable technique, and it says nothing about multiple hosts or a networked
+database. The specific gap on Postgres/SQL Server at READ COMMITTED is the **cross-project
+normal-hours consumption** check (docs/01-domain.md "overtime allocation"): two concurrent
+invoice-creation transactions for the same worker's worklogs on two different projects, same
+calendar date, could each read the same "prior normal hours consumed so far" total and both
+allocate that worker's first 8 hours of the day as normal time — an under-counted-overtime race
+that the `Worklog.Version` token and the `InvoiceLine.WorklogId` PK do **not** prevent (they
+stop the same worklog being claimed twice, not two different worklogs each mis-computing
+overtime for a shared capacity they both read as unconsumed). Production fix: the same kind of
+per-(worker, date) lock/serialization the daily-hours-race note already asks for (e.g. a
+`WorkerDay` row read `FOR UPDATE` as part of computing prior-normal-hours), or running the whole
+invoice-creation transaction at `SERIALIZABLE` and retrying on serialization failure.
+
 ## Idempotency
 
 Idempotency solves retries of the same logical command; it is not a replacement for concurrency control over business resources.
 
 Invoice creation requires an `Idempotency-Key` (or equivalent explicit mechanism).
+
+**POC decision (iteration 3): not implemented yet.** `InvoiceService.CreateInvoiceAsync` has no
+idempotency-key mechanism this iteration — a client retry of the same logical "create invoice
+for project X" request after a successful first attempt will not replay the original invoice;
+it will either find no eligible worklogs left (`Validation`, since they are already `Invoiced`)
+or, if some new approved worklogs arrived in between, create a second, smaller invoice. This is
+scoped out deliberately (no API endpoints exist yet for invoice creation either) rather than
+built superficially. Follow-up: implement per the record shape suggested below (key +
+scope/operation + request fingerprint + status + resulting resource id), backed by a DB
+uniqueness constraint on the key, at the same time `POST /api/projects/{projectId}/invoices` is
+built (docs/03-api-transactions.md).
 
 Persist enough information to distinguish:
 

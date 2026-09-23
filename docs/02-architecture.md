@@ -100,6 +100,20 @@ Keep the legacy stored-procedure adapter in Infrastructure. The modern implement
 
 The seam exists so equivalent business input can be sent through old and new implementations and normalized for comparison.
 
+### POC decision (iteration 3)
+
+The seam is `Application/IInvoiceCalculator.cs`: a pure, DB-free contract —
+`Calculate(IReadOnlyList<WorklogBillingInput>, priorNormalHoursByWorkerDate) -> IReadOnlyList<CalculatedInvoiceLine>`.
+`ModernInvoiceCalculator` (also in `Application/`) is the only implementation that exists this
+iteration. It is intentionally an interface with one implementation today — normally a
+speculative abstraction — because the second implementation and the differential harness that
+compares the two are explicitly planned, not hypothetical, follow-up work
+(`docs/05-testing-and-differential.md`, `docs/06-implementation-plan.md` Phase 4): a legacy
+stored-procedure adapter belongs in `Infrastructure/`, implementing the same
+`IInvoiceCalculator` interface, taking the same input records, and producing the same
+`CalculatedInvoiceLine` output shape so a comparator can run both against identical input and
+diff the results field-by-field. Not built this iteration to keep scope tight.
+
 ## Persistence
 
 EF Core is acceptable directly. Do not create repository interfaces solely to wrap every DbSet call.

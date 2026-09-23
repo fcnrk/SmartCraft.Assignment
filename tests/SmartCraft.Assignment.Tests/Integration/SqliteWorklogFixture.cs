@@ -42,12 +42,12 @@ internal sealed class SqliteWorklogFixture : IDisposable
         db.Workers.AddRange(worker, otherWorker, unassignedWorker);
 
         var project = Project.Create("Project Alpha");
-        project.AssignWorker(worker.Id);
-        project.AssignWorker(otherWorker.Id);
+        project.AssignWorker(worker.Id, "Developer", 100m);
+        project.AssignWorker(otherWorker.Id, "Tester", 80m);
         db.Projects.Add(project);
 
         var secondProject = Project.Create("Project Beta");
-        secondProject.AssignWorker(worker.Id);
+        secondProject.AssignWorker(worker.Id, "Developer", 120m);
         db.Projects.Add(secondProject);
 
         db.SaveChanges();
@@ -68,6 +68,9 @@ internal sealed class SqliteWorklogFixture : IDisposable
     }
 
     public WorklogService NewService() => new(CreateContext());
+
+    public InvoiceService NewInvoiceService(TimeProvider? timeProvider = null) =>
+        new(CreateContext(), new ModernInvoiceCalculator(), timeProvider ?? TimeProvider.System);
 
     public void Dispose()
     {

@@ -31,11 +31,12 @@ public sealed class Project
         };
     }
 
-    /// <summary>Assigns a worker to this project. Rejects a duplicate assignment
-    /// (docs/02-architecture.md: unique (ProjectId, WorkerId)); this is a state
-    /// conflict rather than bad input, so it maps to <see cref="DomainErrorKind.Conflict"/>,
-    /// the same kind used elsewhere for "valid request, current state disagrees".</summary>
-    public ProjectAssignment AssignWorker(Guid workerId)
+    /// <summary>Assigns a worker to this project with their billing role/rate for it
+    /// (docs/01-domain.md rule 12). Rejects a duplicate assignment (docs/02-architecture.md:
+    /// unique (ProjectId, WorkerId)); this is a state conflict rather than bad input, so it
+    /// maps to <see cref="DomainErrorKind.Conflict"/>, the same kind used elsewhere for
+    /// "valid request, current state disagrees".</summary>
+    public ProjectAssignment AssignWorker(Guid workerId, string workerRole, decimal hourlyRate)
     {
         if (workerId == Guid.Empty)
         {
@@ -47,7 +48,7 @@ public sealed class Project
             throw new DomainException(DomainErrorKind.Conflict, "Worker is already assigned to this project.");
         }
 
-        var assignment = ProjectAssignment.Create(Id, workerId);
+        var assignment = ProjectAssignment.Create(Id, workerId, workerRole, hourlyRate);
         _assignments.Add(assignment);
         return assignment;
     }
