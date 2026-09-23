@@ -14,14 +14,31 @@ The exercise prioritizes engineering judgment over feature count: explicit domai
 
 ## Repository state and commands
 
-Solution scaffolded (net10.0). `SmartCraft.Assignment.slnx` at repo root references `src/SmartCraft.Assignment.Api/` (`Domain/` — Worklog/Worker/Project/ProjectAssignment; `Infrastructure/` — `AppDbContext`; `Application/` — `WorklogService`; `Endpoints/` not added yet) and `tests/SmartCraft.Assignment.Tests/` (xUnit, project reference to the Api project). DB: SQLite via EF Core (`Microsoft.EntityFrameworkCore.Sqlite`), schema via `EnsureCreated` (no migrations) — see `docs/02-architecture.md` Database section.
+`SmartCraft.Assignment.slnx` (net10.0) references `src/SmartCraft.Assignment.Api/` and `tests/SmartCraft.Assignment.Tests/` (xUnit).
+
+- `Domain/`: Worklog, Worker, Project, ProjectAssignment, Invoice, InvoiceLine.
+- `Application/`:
+  - `WorklogService` and `InvoiceService`;
+  - the `IInvoiceCalculator` seam, implemented by `ModernInvoiceCalculator`.
+- `Infrastructure/`:
+  - `AppDbContext`, `IdempotencyRecord` and `SeedData`;
+  - `LegacyInvoiceCalculator`: a simulated stored-procedure adapter, used by tests only.
+- `Authorization/`: capability permissions and policies.
+- `Endpoints/`: Minimal APIs, `DomainExceptionHandler`, and `/dev/token` (Development only).
+- Tests:
+  - `Domain/`: unit tests;
+  - `Integration/`: real SQLite files, concurrency tests;
+  - `Api/`: WebApplicationFactory;
+  - `Differential/`: legacy vs modern.
+
+DB: SQLite via EF Core, schema via `EnsureCreated` (no migrations), seeded on startup — see `docs/02-architecture.md` Database section. Auth: JWT bearer with one policy per permission. Swagger at `/swagger` in Development. See `README.md` for API usage.
 
 - Build: `dotnet build`
 - All tests: `dotnet test`
 - Single test: `dotnet test --filter "FullyQualifiedName~<TestName>"`
 - Run API: `dotnet run --project src/SmartCraft.Assignment.Api`
-
-Update this section again when persistence/DB choice lands.
+- Differential tests only: `dotnet test --filter "FullyQualifiedName~Differential"`
+- Docker: `docker compose up --build` (or `docker build -t smartcraft-assignment .` then `docker run --rm -p 8080:8080 smartcraft-assignment`)
 
 ## Scope discipline
 

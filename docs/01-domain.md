@@ -131,7 +131,7 @@ For the POC, choose and document a deterministic policy (for example chronologic
   `Worklog.Id` as a stable tie-breaker. ponytail: `Worklog.Id` is an arbitrary-but-stable
   tie-breaker, not legacy's real chronological order — `Worklog` has no creation timestamp
   today. A real migration must recover and verify legacy's actual ordering rule before this can
-  be trusted as behaviorally equivalent; this POC's differential harness (future work, see
+  be trusted as behaviorally equivalent; this POC's differential harness (`tests/.../Differential/InvoiceDifferentialTests.cs`, see
   `docs/05-testing-and-differential.md`) is where that gap would surface as a mismatch.
 - **A single worklog can split into normal and overtime hours on the same line** (rule 14): the
   remaining-normal-capacity check runs per worklog in the order above, consuming from the day's

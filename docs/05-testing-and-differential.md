@@ -100,6 +100,33 @@ Classify differences as:
 
 Never silently change the comparator to make a failing difference disappear.
 
+## POC decision (iteration 4)
+
+- **Harness:** `tests/SmartCraft.Assignment.Tests/Differential/InvoiceDifferentialTests.cs`.
+  Each fixture runs the same `WorklogBillingInput`s and prior-consumed normal hours through
+  `LegacyInvoiceCalculator` and `ModernInvoiceCalculator`.
+  - Normalization matches lines by WorklogId and compares every business field plus the
+    invoice total by decimal value, so `1.5` and `1.50` are equal.
+  - A worklog consumed by only one side is reported as `ConsumedWorklog`.
+- **Classification is data, not a comparator filter.** Each fixture lists its expected
+  differences as `(WorklogId, Field, Classification, Reason)`.
+  - The test fails on any unlisted difference, and prints `Worklog / Field / Legacy / Modern`.
+  - It also fails when a listed difference stops occurring, so a classification can't go stale.
+- **Fixtures:**
+  - under 8h;
+  - exactly 8h;
+  - overtime split across worklogs on the same day;
+  - separate days;
+  - a half-cent midpoint (0.5h × 20.25 = 10.125 → 10.13);
+  - normal time already consumed by an earlier invoice.
+- **The one classified difference is `LegacyDefect`.** The simulated procedure applies the
+  8h/day ceiling only within the current batch. The modern calculator applies rule 13 across
+  invoices.
+- **Limitation:** the legacy behavior is fabricated, so passing fixtures prove nothing about
+  real compatibility. With a real procedure, the adapter body becomes an `EXEC`, and the
+  fixtures and comparator stay the same. The planned next step is a shadow mode that runs both
+  calculators on real invoice requests and logs the classified diffs. It is not built.
+
 ## AI verification loop
 
 1. human defines/clarifies rule

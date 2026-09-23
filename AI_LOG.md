@@ -1035,3 +1035,72 @@ Pending review.
 - Reviewer I2 (overtime allocation depends on invoicing order), M3 and M5 remain open.
 - The legacy adapter and differential harness remain open.
 - The CLAUDE.md commands section needs a human decision.
+
+
+---
+
+### AI-022 — Orchestrator: legacy adapter seam, differential harness, final docs and verification
+
+**When:** 2026-09-24, sequence 22
+
+**Purpose / context:**  
+Final pass for submission: Phase 4 (legacy seam plus differential verification), README and CLAUDE.md completion, and the final verification checklist from CLAUDE.md.
+
+**Prompt:**  
+
+> (Human) "Final pass. Add the legacy invoice adapter seam and a small differential test harness comparing legacy vs modern invoice results. Then finish README and CLAUDE.md: how to run, API/auth usage, key decisions and trade-offs, known limitations, AI usage and verification, what I would do next. Do not expand scope or revisit existing design unless something is broken. Run build, tests and Docker smoke check, update AI_LOG.md, and stop when the repo is submission-ready."
+
+**AI output / recommendation summary:**  
+Done inline by the orchestrator, with no agents spawned. The human did not ask for agents this time, and the previous test-writer run had hit the account spend limit (AI-020).
+- **`Infrastructure/LegacyInvoiceCalculator.cs`:** a second `IInvoiceCalculator`.
+  - It is the shape of a stored-procedure adapter: its doc comment describes the `EXEC` plus table-valued-parameter mapping it would use for real.
+  - The procedure body is **simulated** in a row-by-row, cursor-like style.
+  - It carries one deliberate, documented quirk: the 8h/day ceiling is applied only within the current batch, and prior invoiced normal hours are ignored. This gives the harness a real difference to classify.
+  - It is not registered in DI.
+- **`tests/.../Differential/InvoiceDifferentialTests.cs`:**
+  - Normalized field-by-field comparison: lines keyed by WorklogId, decimals compared by value, a consumed-worklog set difference, and the invoice total.
+  - Readable `Worklog / Field / Legacy / Modern` diagnostics.
+  - 6 fixtures, each with an explicit list of classified expected differences. The test fails on any unlisted difference, and on a listed one that no longer occurs.
+  - A comparator diagnostics test.
+  - A test showing the legacy adapter plugs into `InvoiceService`, where it passes the I1 output validation.
+- The one expected difference, a batch-only ceiling, is classified **LegacyDefect** against rule 13.
+- Docs:
+  - docs/02 and docs/05 each gained a "POC decision (iteration 4)" section;
+  - the stale "future work" pointer in docs/01 now points to the harness;
+  - the CLAUDE.md "Repository state and commands" section was rewritten, as the human asked (AI-019 had left it stale);
+  - README restructured into the requested sections.
+
+**Files changed:**  
+- `src/SmartCraft.Assignment.Api/Infrastructure/LegacyInvoiceCalculator.cs` (new)
+- `tests/SmartCraft.Assignment.Tests/Differential/InvoiceDifferentialTests.cs` (new)
+- `README.md`, `CLAUDE.md`
+- `docs/01-domain.md`, `docs/02-architecture.md`, `docs/05-testing-and-differential.md`
+
+**Human decision:**  
+Pending review.
+
+**Verification performed:**
+- `dotnet test` — **PASS** — 128/128 (120 + 8 new)
+- The first rounding fixture (1.5h and 7.25h at 33.33) did not contain a midpoint that separates AwayFromZero from ToEven, so it could not catch a rounding-mode regression. Replaced it with 0.5h × 20.25 = 10.125.
+- Mutation "legacy rounding ToEven" — **CAUGHT** — unclassified difference
+- Mutation "legacy quirk removed" — **CAUGHT** — "classified differences no longer occur"
+- Mutation "modern multiplier 1.25" — **CAUGHT** — unclassified differences in 4 fixtures
+- Restored both calculators; `git diff --quiet` on the modern calculator is clean.
+- `dotnet clean` followed by `dotnet build --no-incremental` — **PASS** — 0 warnings, 0 errors
+- `dotnet test` — **PASS** — 128/128
+- `docker build`, then run on port 18080 with a curl smoke test — **PASS**:
+  - anonymous request 401; Swagger 200; projects 200;
+  - create a 10h worklog, then submit;
+  - stale-version approve 409, then approve 200;
+  - invoice without a key 400;
+  - invoice 201 with total 1100.00 (8 normal + 2 overtime);
+  - same-key replay 200;
+  - a worker without `invoice:create` gets 403.
+
+**Issues / assumptions discovered:**
+- The legacy behavior is fabricated, so the passing fixtures show the harness works, not real compatibility. This is stated in the code, docs/05 and README.
+- The API JSON shows unnormalized decimal scale (`"hourlyRate":100.0`, `"overtimeAmount":300.00`) because SQLite TEXT decimals round-trip that way. Values are exact. Documented in the README; not fixed, since that would be outside this pass's scope.
+- The senior reviewer was not run, consistent with the previous instruction. Nothing significant surfaced.
+
+**Follow-up:**
+- See README "What I would do next". I2 (overtime-policy ownership) is the most important open item.

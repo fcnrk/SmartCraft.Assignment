@@ -114,6 +114,15 @@ stored-procedure adapter belongs in `Infrastructure/`, implementing the same
 `CalculatedInvoiceLine` output shape so a comparator can run both against identical input and
 diff the results field-by-field. Not built this iteration to keep scope tight.
 
+### POC decision (iteration 4)
+
+`Infrastructure/LegacyInvoiceCalculator.cs` is the second `IInvoiceCalculator`. It stands in for
+the adapter that would run the legacy stored procedure (a table-valued parameter in, a result
+set mapped onto `CalculatedInvoiceLine` out). There is no legacy database, so it simulates the
+procedure body. It is not registered in DI: production invoices always use the modern
+calculator, and the legacy one runs only in the differential harness (docs/05). It still goes
+through `InvoiceService`'s output validation when plugged in, which is tested.
+
 ## Persistence
 
 EF Core is acceptable directly. Do not create repository interfaces solely to wrap every DbSet call.
