@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SmartCraft.Assignment.Api/SmartCraft.Assignment.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SmartCraft.Assignment.Tests/SmartCraft.Assignment.Tests.csproj" />
+  </Folder>
+</Solution>
