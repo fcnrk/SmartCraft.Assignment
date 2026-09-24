@@ -23,43 +23,22 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
             ?? throw new DomainException(DomainErrorKind.NotFound, $"Invoice {invoiceId} was not found.");
 
     /// <summary>
-    /// docs/03-api-transactions.md "Create invoice": load project + eligible worklogs,
-    /// calculate, persist invoice + lines, mark worklogs invoiced — one transaction (rule 16).
-    /// Same BEGIN IMMEDIATE pattern as WorklogService (see its
-    /// EnsureDailyHoursWithinLimitAsync doc comment for the full decompiled-verified story):
-    /// opening the transaction up front takes SQLite's single write lock before this method's
-    /// SELECTs run, so two concurrent CreateInvoiceAsync calls (same or different projects)
-    /// are fully serialized against this file — neither can read approved/uninvoiced worklogs
-    /// or prior-invoiced normal hours the other has not yet committed, so neither can both
-    /// claim the same worklog nor both under-count a shared worker/day's already-consumed
-    /// normal capacity (docs/04 "competing invoice requests"; docs/01-domain.md "overtime
-    /// allocation" cross-project consumption note).
+    /// docs/03 "Create invoice": select eligible worklogs, calculate, persist invoice + lines,
+    /// mark worklogs invoiced, record the idempotency key — one transaction (rule 16).
     ///
-    /// Ceiling: this is SQLite's single-writer model doing the work, not a portable technique
-    /// (same ceiling WorklogService already documents for rule 3). On Postgres/SQL Server at
-    /// READ COMMITTED, two concurrent invoice-creation transactions could each read the same
-    /// pre-invoice "prior normal hours" total for a shared worker/day and both allocate that
-    /// worker's first 8 hours as normal on that day — an under-counted-overtime race that a
-    /// normal transaction does not prevent there. Production fix: the same kind of per-
-    /// (worker,date) lock/serialization WorklogService's rule-3 note already asks for (e.g. a
-    /// WorkerDay row locked FOR UPDATE, read as part of computing prior-normal-hours), or
-    /// SERIALIZABLE + retry. What SQLite exclusivity is NOT the only thing protecting: the
-    /// Worklog.Version concurrency token (a worklog claimed/modified between load and save)
-    /// and InvoiceLine's WorklogId-as-primary-key (rule 9, double-invoicing) are DB constraints
-    /// that hold on any database, independent of isolation level — see
-    /// <see cref="TrySaveAsync"/>.
+    /// ponytail: as in WorklogService, <c>BEGIN IMMEDIATE</c> serializes concurrent invoice
+    /// runs on SQLite, which is what keeps the cross-project "prior normal hours" read
+    /// consistent. On Postgres/SQL Server at READ COMMITTED that read needs a per-(worker, date)
+    /// lock or SERIALIZABLE + retry. Portable regardless of isolation: the Worklog.Version token
+    /// and the InvoiceLine.WorklogId primary key (rule 9) — see <see cref="TrySaveAsync"/>.
     ///
-    /// Idempotency (docs/04 "Idempotency"): <paramref name="idempotencyKey"/> is required by
-    /// the endpoint. The key is looked up inside the same BEGIN IMMEDIATE transaction, before
-    /// any other read: same key + same <paramref name="projectId"/> replays the original
-    /// invoice (no new effect); same key + a different project is a Conflict. A record is only
-    /// written on a successful invoice creation, in the same SaveChanges/commit as the invoice
-    /// and worklog claims — a failed attempt (e.g. no eligible worklogs) leaves no record, so a
-    /// retry with the same key after a failure runs the request fresh rather than replaying a
-    /// failure. The DB primary key on <c>IdempotencyRecord.Key</c> is defense-in-depth for a
-    /// concurrent same-key request that reaches SaveChanges after this method's own lookup
-    /// found nothing (see <see cref="TrySaveAsync"/>): the loser rolls back and replays the
-    /// winner's now-committed record instead of erroring.
+    /// Idempotency (docs/04): the key is looked up first, inside the transaction. Same key +
+    /// same project replays; same key + different project is a Conflict. The record is only
+    /// written with a successful invoice, so a failed attempt can be retried fresh. The key's
+    /// primary key catches a concurrent same-key request; the loser replays the winner.
+    ///
+    /// Rates come from the project's current assignment at invoice time, not at work time —
+    /// see README "Known limitations".
     /// </summary>
     public async Task<InvoiceCreationResult> CreateInvoiceAsync(Guid projectId, string idempotencyKey, CancellationToken ct = default)
     {
@@ -292,12 +271,9 @@ public sealed class InvoiceService(AppDbContext db, IInvoiceCalculator calculato
     private static bool IsUniqueConstraintViolation(DbUpdateException ex) =>
         ex.InnerException is SqliteException { SqliteExtendedErrorCode: 1555 or 2067 }; // SQLITE_CONSTRAINT_PRIMARYKEY / SQLITE_CONSTRAINT_UNIQUE
 
-    /// <summary>Same SQLite busy/locked mapping + change-tracker cleanup as
-    /// WorklogService.WithBusyMappingAsync — see that method's doc comment for the full
-    /// rationale (not duplicated here). Kept as a separate copy rather than a shared helper:
-    /// the two services don't otherwise share a base type/module, and the guard is small
-    /// enough that extracting one now would be speculative given neither is registered in DI
-    /// or has a caller yet.</summary>
+    /// <summary>Same busy/locked mapping + change-tracker cleanup as
+    /// WorklogService.WithBusyMappingAsync (see there). ponytail: duplicated rather than shared
+    /// — two ~20-line copies; extract a helper if a third service needs it.</summary>
     private async Task<T> WithBusyMappingAsync<T>(Func<Task<T>> operation)
     {
         try

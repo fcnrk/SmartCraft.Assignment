@@ -134,7 +134,7 @@ Tests should derive expected behavior from documented requirements rather than s
 
 Reviewer findings must be validated against the actual code before changes are made.
 
-All meaningful agent activity must be recorded in `docs/AI_LOG.md` according to the project's AI logging rules.
+All meaningful agent activity must be recorded in `AI_LOG.md` (repo root) according to the project's AI logging rules.
 
 ## Mandatory AI development log
 
